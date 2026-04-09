@@ -1,5 +1,5 @@
 """
-TIGHTLY-COUPLED MSCKF VIO — OAK-D S2 — KEYFRAME GATED & HW OPTIMIZED
+TIGHTLY-COUPLED VIO — OAK-D S2 — KEYFRAME GATED & HW OPTIMIZED & HUD ENABLED
 =============================================================================
 """
 
@@ -15,7 +15,7 @@ import math
 
 # IMPORT OUR CUSTOM MODULES
 from load_config import CFG
-from utils import HAS_NUMBA, fast_underwater_restore
+from utils import DepthDoubleBuffer, HAS_NUMBA, fast_underwater_restore
 from ekf import VIO_EKF
 
 # ============================================================
@@ -29,7 +29,6 @@ os.makedirs(RGB_DIR, exist_ok=True)
 os.makedirs(DEPTH_DIR, exist_ok=True)
 
 TARGET_FPS = CFG["hardware"]["target_fps"]
-TIME_OFFSET_MS = CFG["hardware"].get("time_offset_cam_imu_ms", 0.0)
 IMU_RATE   = CFG["hardware"]["imu_rate_hz"]
 USE_IR_PROJECTOR   = CFG["hardware"]["use_ir_projector"]
 IR_DOT_BRIGHTNESS  = CFG["hardware"]["ir_dot_brightness_ma"]
@@ -43,6 +42,12 @@ GATE_MAX_FRAME_GAP   = CFG["keyframe_gating"]["max_frame_gap"]
 GATE_MIN_DEPTH_VALID = CFG["keyframe_gating"]["min_depth_valid_ratio"]
 GATE_MAX_BLUR_PIXELS = CFG["keyframe_gating"]["max_blur_pixels"]
 
+STATIC_VAR_THR   = CFG["ekf_tuning"]["static_variance_threshold"]
+MIN_GRAV_SAMPLES = CFG["ekf_tuning"]["min_gravity_samples"]
+MIN_FEAT_UPDATE  = CFG["ekf_tuning"]["min_feature_update"]
+DEPTH_MIN_MM     = CFG["ekf_tuning"]["depth_min_mm"]
+DEPTH_MAX_MM     = CFG["ekf_tuning"]["depth_max_mm"]
+
 CR_CFG = CFG.get("color_restore", {})
 CR_ENABLED = CR_CFG.get("enabled", False)
 CR_R_MAX = CR_CFG.get("r_max_gain", 3.0)
@@ -53,15 +58,35 @@ CR_REC = CR_CFG.get("apply_to_recording", True)
 ISP_WIDTH  = 960
 ISP_HEIGHT = 540
 
+# Optical Flow & Feature Tracker Tuned for Pi CPU efficiency
+lk_params = dict(
+    winSize=(21, 21),
+    maxLevel=3,
+    criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+    minEigThreshold=1e-4
+)
+
+feature_params = dict(
+    maxCorners=150,
+    qualityLevel=0.02,
+    minDistance=15,
+    blockSize=9,
+    useHarrisDetector=True,
+    k=0.04
+)
+
 # ============================================================
 # SHARED STATE & BUFFERS
 # ============================================================
 latest_jpeg  = None
 jpeg_lock    = threading.Lock()
 recording_event = threading.Event()
+visual_queue = queue.Queue(maxsize=1)
 stop_event   = threading.Event()
 
-disk_queue = queue.Queue(maxsize=200)
+lk_queue = queue.Queue(maxsize=1)
+lk_result_queue = queue.Queue(maxsize=1)
+prev_mean_intensity = None
 disk_health = {"consecutive_drops": 0}
 
 cam_ctrl_lock = threading.Lock()
@@ -77,19 +102,47 @@ hud_telemetry = {
     "score": 1.0,
     "blur": 0.0,
     "depth_pct": 0.0,
-    "active_tracks": 0,
-    "message": "AWAITING GRAVITY CALIBRATION"
+    "message": "AWAITING GRAVITY CALIBRATION",
+    "cpu_fallback": False 
 }
 hud_lock = threading.Lock()
 runtime_state = {"bad_streak_counter": 0} 
 
 # ============================================================
+# ZERO-COPY BUFFERS
+# ============================================================
+MAX_FEATURES = 150
+pp_buffer = np.empty((MAX_FEATURES, 2), dtype=np.float32)
+pc_buffer = np.empty((MAX_FEATURES, 2), dtype=np.float32)
+
+# ============================================================
 # THREADS
 # ============================================================
+def visual_worker(ekf, K_mat, T_ic, T_ci):
+    ok = 0
+    fail = 0
+    while not stop_event.is_set():
+        try: 
+            item = visual_queue.get(timeout=0.1)
+        except queue.Empty: 
+            continue
+            
+        if item is None: 
+            break
+            
+        r, n = ekf.update_visual(item[0], item[1], item[2], K_mat, T_ic, T_ci, item[3])
+        if r: 
+            ok += 1
+        else: 
+            fail += 1
+        visual_queue.task_done()
+
 def imu_worker(device, ekf):
     q = device.getOutputQueue("imu", maxSize=100, blocking=False)
     ab = np.zeros(3, dtype=np.float64)
     gb = np.zeros(3, dtype=np.float64)
+    
+    last_overflow_warning = 0
     
     while not stop_event.is_set():
         try:
@@ -105,13 +158,10 @@ def imu_worker(device, ekf):
                             ts = a.timestamp.get().total_seconds()
                         except AttributeError: 
                             ts = time.monotonic()
-                    
-                    # Apply hardware time offset for perfect Manifold Integration
-                    ts_corrected = ts - (TIME_OFFSET_MS / 1000.0)
                             
                     ab[0], ab[1], ab[2] = a.x, a.y, a.z
                     gb[0], gb[1], gb[2] = g.x, g.y, g.z
-                    ekf.feed_imu(ab, gb, ts_corrected)
+                    ekf.feed_imu(ab, gb, ts)
             else:
                 time.sleep(0.001)
         except Exception as e:
@@ -120,22 +170,29 @@ def imu_worker(device, ekf):
             print(f"  [IMU] {e}")
             time.sleep(0.01)
 
-def disk_worker():
-    while not stop_event.is_set() or not disk_queue.empty():
+def lk_worker():
+    while not stop_event.is_set():
         try:
-            item = disk_queue.get(timeout=0.1)
-            if item is None: 
-                break
-                
-            # Throttled Zlib Compression for PNG Depth Maps
-            if item[0].endswith('.png'):
-                cv2.imwrite(item[0], item[1], [cv2.IMWRITE_PNG_COMPRESSION, 1])
-            else:
-                cv2.imwrite(item[0], item[1])
-                
-            disk_queue.task_done()
-        except queue.Empty: 
+            prev_gray, gray_curr, fallback_pts_prev, prev_ts = lk_queue.get(timeout=0.1)
+        except queue.Empty:
             continue
+            
+        p1, st, err = cv2.calcOpticalFlowPyrLK(prev_gray, gray_curr, fallback_pts_prev, None, **lk_params)
+        
+        if p1 is not None and st is not None:
+            p0_back, st_back, _ = cv2.calcOpticalFlowPyrLK(gray_curr, prev_gray, p1, None, **lk_params)
+            
+            if p0_back is not None:
+                fb_error = np.linalg.norm(fallback_pts_prev - p0_back, axis=2).flatten()
+                valid_mask = (st.flatten() == 1) & (st_back.flatten() == 1) & (fb_error < 1.0)
+                
+                good_new = p1[valid_mask]
+                good_old = fallback_pts_prev[valid_mask]
+                
+                try:
+                    lk_result_queue.put_nowait((good_old, good_new, prev_ts))
+                except queue.Full:
+                    pass
 
 # ============================================================
 # WEB SERVER (DUAL STREAM + GUI SLIDER + HARDENED PARSING)
@@ -211,7 +268,9 @@ class MJPEGHandler(http.server.BaseHTTPRequestHandler):
                         cv2.putText(frame, f"STATE: {telem['state']}", (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
                         cv2.putText(frame, f"LAPLV: {telem['blur']:.1f}", (15, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                         cv2.putText(frame, f"DEPTH: {telem['depth_pct']*100:.1f}%", (15, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                        cv2.putText(frame, f"TRACKS: {telem.get('active_tracks', 0)}", (15, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                        
+                        if telem.get("cpu_fallback"):
+                            cv2.putText(frame, "CPU OPTICAL FLOW ACTIVE", (15, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
                         
                         if recording_event.is_set():
                             cv2.putText(frame, "REC", (w - 80, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 3)
@@ -281,6 +340,32 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     pass
     
 threading.Thread(target=lambda: ThreadedHTTPServer(('', 8080), MJPEGHandler).serve_forever(), daemon=True).start()
+
+# ============================================================
+# ASYNC DISK I/O WORKER
+# ============================================================
+disk_queue = queue.Queue(maxsize=200)
+
+def disk_worker():
+    while not stop_event.is_set() or not disk_queue.empty():
+        try:
+            item = disk_queue.get(timeout=0.1)
+            if item is None: 
+                break
+            filepath, img = item[0], item[1]
+            
+            # Throttled Zlib Compression for PNG Depth Maps
+            if filepath.endswith('.png'):
+                cv2.imwrite(filepath, img, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+            else:
+                cv2.imwrite(filepath, img)
+            
+            disk_queue.task_done()
+        except queue.Empty: 
+            continue
+
+disk_thread = threading.Thread(target=disk_worker, daemon=False)
+disk_thread.start()
 
 # ============================================================
 # PIPELINE CONFIG
@@ -404,14 +489,11 @@ sync.out.link(xout_s.input)
 # ============================================================
 # MAIN
 # ============================================================
-print(f"Starting Tightly-Coupled MSCKF VIO ({'Numba JIT' if HAS_NUMBA else 'numpy'})...")
+print(f"Starting VIO ({'Numba JIT' if HAS_NUMBA else 'numpy'})...")
 print(f"HUD available at http://<IP>:8080/")
 
 ekf = VIO_EKF()
 saved_poses = []
-
-disk_thread = threading.Thread(target=disk_worker, daemon=False)
-disk_thread.start()
 
 with dai.Device(pipeline) as device:
     print("[SYS] Booting device and stabilizing pipeline (1.5s)...")
@@ -457,7 +539,12 @@ with dai.Device(pipeline) as device:
         T_ic = np.eye(4)
 
     imu_t = threading.Thread(target=imu_worker, args=(device,ekf), daemon=True)
+    vis_t = threading.Thread(target=visual_worker, args=(ekf,K_mat, T_ic, T_ci), daemon=True)
+    lk_thread = threading.Thread(target=lk_worker, daemon=True)
+    
     imu_t.start()
+    vis_t.start()
+    lk_thread.start()
 
     qs = device.getOutputQueue("synced", 4, False)
     qj = device.getOutputQueue("mjpeg", 2, False) 
@@ -466,12 +553,20 @@ with dai.Device(pipeline) as device:
 
     count = 0
     frame_ok = False
+    prev_fd = {}
+    depth_dbuf = None
+    prev_depth = None  
+    prev_ts = 0.0
     ekf_frame_counter = 0     
     last_saved_ekf_idx = 0
     
     current_applied_wb = 0
     current_applied_exp = 0
     current_applied_iso = 0
+
+    gray_curr = None
+    prev_gray = None
+    fallback_pts_prev = None
 
     print(f"\n[EKF] Hold still for gravity calibration...")
 
@@ -491,8 +586,10 @@ with dai.Device(pipeline) as device:
     last_heartbeat = time.time()
     
     telemetry_stats = {
+        "visual_queue_drops": 0,
         "disk_queue_drops": 0,
         "forced_gaps_accepted": 0,
+        "cpu_fallback_engagements": 0
     }
 
     try:
@@ -559,6 +656,11 @@ with dai.Device(pipeline) as device:
                 dep = sy["depth"].getFrame().astype(np.uint16)
                 fm = sy["features"]
                 
+                try:
+                    rgb_ts = sy["rgb"].getTimestamp().total_seconds()
+                except AttributeError:
+                    rgb_ts = time.monotonic()
+                
                 # Zero-Math Grayscale: Extracting the Green channel directly
                 gray_curr = raw_rgb[:, :, 1].copy()
                 
@@ -570,6 +672,10 @@ with dai.Device(pipeline) as device:
                 if not frame_ok:
                     print(f"  [CAL] Frame: {raw_rgb.shape[1]}×{raw_rgb.shape[0]}")
                     frame_ok = True
+                    
+                if depth_dbuf is None:
+                    depth_dbuf = DepthDoubleBuffer(dep.shape[0], dep.shape[1])
+                depth_dbuf.write(dep)
 
                 if count == 0 and not ekf.is_ready() and frame_ok:
                     now = time.time()
@@ -669,12 +775,7 @@ with dai.Device(pipeline) as device:
                                 hud_telemetry["message"] = ""
 
                     if accept:
-                        # Extract VPU feature tracks directly
-                        f_dict = {t.id: (t.position.x, t.position.y) for t in fm.trackedFeatures}
-                        
-                        # Feed the features to MSCKF. Note: Triangulation is handled internally using the camera poses.
                         ekf.set_keyframe()
-                        success, active_tracks = ekf.add_visual_tracks(count, f_dict, K_mat, T_ic)
                         T, cov6 = ekf.get_pose()
                         Tc = T @ T_ic
                         
@@ -706,11 +807,94 @@ with dai.Device(pipeline) as device:
                         last_saved_ekf_idx = ekf_frame_counter
                         
                         if count % 10 == 0:
+                            p = Tc[:3,3]
                             print(f"  [{count:04d} | idx:{ekf_frame_counter}] "
-                                  f"Health: {quality_score:.2f} ({quality_state}) | {reason} | Tracks: {active_tracks}")
+                                  f"Health: {quality_score:.2f} ({quality_state}) | {reason}")
 
+                if fm and gray_curr is not None:
+                    cf = {t.id:(float(t.position.x),float(t.position.y)) for t in fm.trackedFeatures}
+                    ds_curr = depth_dbuf.read() if depth_dbuf else None
+                    
+                    hw_features_sent = False
+                    cpu_fallback_active = False
+
+                    if prev_fd and prev_depth is not None and ekf.is_ready():
+                        pp, pc = [], []
+                        for fid, c in cf.items():
+                            if fid in prev_fd: 
+                                pp.append(prev_fd[fid])
+                                pc.append(c)
+                                
+                        if len(pp) >= MIN_FEAT_UPDATE:
+                            try: 
+                                n_pts = min(len(pp), MAX_FEATURES)
+                                for i in range(n_pts):
+                                    pp_buffer[i, 0] = pp[i][0]
+                                    pp_buffer[i, 1] = pp[i][1]
+                                    pc_buffer[i, 0] = pc[i][0]
+                                    pc_buffer[i, 1] = pc[i][1]
+                                    
+                                visual_queue.put_nowait((pp_buffer[:n_pts].copy(), pc_buffer[:n_pts].copy(), prev_depth.copy(), prev_ts))
+                                hw_features_sent = True
+                                fallback_pts_prev = pc_buffer[:n_pts].copy().reshape(-1, 1, 2)
+                            except queue.Full: 
+                                telemetry_stats["visual_queue_drops"] += 1
+                                pass
+                    
+                    if not hw_features_sent and prev_gray is not None and ekf.is_ready():
+                        cpu_fallback_active = True
+                        
+                        curr_mean = np.mean(gray_curr)
+                        intensity_ratio = 1.0
+                        if prev_mean_intensity is not None:
+                            intensity_ratio = curr_mean / max(prev_mean_intensity, 1.0)
+                            
+                            if intensity_ratio < 0.8 or intensity_ratio > 1.2:
+                                print(f"  [WARN] Illumination jump detected ({intensity_ratio:.2f}×). Skipping CPU fallback.")
+                                fallback_pts_prev = None
+                                cpu_fallback_active = False
+                                
+                        prev_mean_intensity = curr_mean
+
+                        if cpu_fallback_active:
+                            if fallback_pts_prev is not None and len(fallback_pts_prev) > 0:
+                                try:
+                                    lk_queue.put_nowait((prev_gray.copy(), gray_curr.copy(), fallback_pts_prev, prev_ts))
+                                except queue.Full:
+                                    pass  
+                                
+                                try:
+                                    good_old, good_new, async_prev_ts = lk_result_queue.get_nowait()
+                                    if len(good_new) >= MIN_FEAT_UPDATE:
+                                        try:
+                                            good_old_flat = good_old.reshape(-1, 2).copy()
+                                            good_new_flat = good_new.reshape(-1, 2).copy()
+                                            
+                                            visual_queue.put_nowait((good_old_flat, good_new_flat, prev_depth, async_prev_ts))
+                                            fallback_pts_prev = good_new.reshape(-1, 1, 2)
+                                            telemetry_stats["cpu_fallback_engagements"] += 1
+                                        except queue.Full:
+                                            telemetry_stats["visual_queue_drops"] += 1
+                                    else:
+                                        new_pts = cv2.goodFeaturesToTrack(gray_curr, mask=None, **feature_params)
+                                        fallback_pts_prev = new_pts if new_pts is not None else np.empty((0, 1, 2), dtype=np.float32)
+                                except queue.Empty:
+                                    pass
+                            else:
+                                new_pts = cv2.goodFeaturesToTrack(gray_curr, mask=None, **feature_params)
+                                fallback_pts_prev = new_pts if new_pts is not None else np.empty((0, 1, 2), dtype=np.float32)
+                        
                     with hud_lock:
-                        hud_telemetry["active_tracks"] = len(ekf.tracks)
+                        hud_telemetry["cpu_fallback"] = cpu_fallback_active
+                    
+                    prev_fd = cf
+                    prev_gray = gray_curr.copy()
+                    prev_ts = rgb_ts
+                    
+                    if ds_curr is not None:
+                        valid_ratio = float(np.count_nonzero(ds_curr)) / ds_curr.size
+                        if valid_ratio > 0.15:
+                            prev_depth = ds_curr.copy()
 
             time.sleep(0.001)
 
@@ -720,12 +904,19 @@ with dai.Device(pipeline) as device:
         stop_event.set()
         recording_event.clear()
         
+        while not visual_queue.empty():
+            try: visual_queue.get_nowait()
+            except: break
+        visual_queue.put(None)
+        
         while not disk_queue.empty():
             try: disk_queue.get_nowait()
             except: break
         disk_queue.put(None)
 
         imu_t.join(timeout=2.0)
+        vis_t.join(timeout=2.0)
+        lk_thread.join(timeout=2.0)
         disk_thread.join(timeout=30.0)
         
         if has_tty and old_settings:

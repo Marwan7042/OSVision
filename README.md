@@ -115,16 +115,44 @@ Handles global trajectory optimization and volumetric mapping.
 
 ## Configuration (`config.json`)
 
-System parameters are defined externally in `config.json`. Key tunables include:
+System parameters are defined externally in `config.json`.
 
-| Parameter | Description |
-| :--- | :--- |
-| `calibration_mode` | Select `"custom"` for underwater EEPROM or `"factory"` for standard air deployment. |
-| `max_blur_pixels` | Rejection threshold for estimated gyroscopic blur. |
-| `static_variance_threshold`| Maximum IMU variance permitted for gravity initialization. |
-| `weight_depth` / `weight_blur`| Quality scoring weights for keyframe selection. |
-| `voxel_tsdf_m` | Volumetric resolution of the final 3D mesh (e.g., `0.005` = 5mm). |
-```
+### Practical tuning guide
+
+| Group | Parameter | What it controls | Typical tweak direction |
+| :--- | :--- | :--- | :--- |
+| `paths` | `scan_dir` | Output session folder (`rgb/`, `depth/`, `poses.json`). | Change per mission/dataset. |
+| `hardware` | `target_fps` | Camera/stereo frame rate on Pi. | Lower if Pi overheats or drops frames; raise only if budgets remain healthy. |
+| `hardware` | `imu_rate_hz` | IMU sample rate for propagation. | Keep high for aggressive motion; lower if CPU constrained. |
+| `hardware` | `calibration_mode` | `"custom"` EEPROM vs `"factory"` calibration selection. | Use `custom` underwater unless factory is known-good. |
+| `hardware` | `exposure_time_us`, `iso_sensitivity` | Brightness/noise tradeoff in low light. | Increase for dark scenes, reduce to limit blur/noise. |
+| `hardware` | `decimate_factor` | Reconstruction-side image downscaling factor. | Increase to reduce laptop load, decrease for finer geometry. |
+| `keyframe_gating` | `min_frame_gap`, `max_frame_gap` | Lower/upper spacing between accepted keyframes. | Increase `min` for less load; keep `max` as safety to avoid starvation. |
+| `keyframe_gating` | `min_depth_valid_ratio` | Minimum valid-depth fraction to accept frame. | Raise in clean water for quality, lower in turbid scenes to keep continuity. |
+| `quality_control` | `score_good_threshold`, `score_weak_threshold` | GOOD/WEAK/BAD state boundaries. | Raise for stricter quality; lower if too many frames become BAD. |
+| `quality_control` | `ideal_depth_ratio` | Target depth coverage ratio for scoring. | Lower for sparse/degraded water visibility. |
+| `ekf_tuning` | `static_variance_threshold`, `min_gravity_samples` | Startup gravity-init strictness. | Relax slightly if init is too slow; tighten if false starts happen. |
+| `ekf_tuning` | `min_feature_update` | Minimum shared tracks before visual update attempt. | Raise for robustness; lower if feature count is often weak. |
+| `ekf_tuning` | `depth_patch_radius`, `depth_min_mm`, `depth_max_mm` | Depth sampling robustness + valid range for visual update. | Increase patch in noisy depth; tighten min/max to reject bad depth tails. |
+| `ekf_tuning` | `imu_vibration_multiplier` | Process noise inflation for vibration-heavy platforms. | Raise if filter is overconfident under vibration; lower if too noisy/drifty. |
+| `information_gating` | `min_information_score` | Required combined info score (depth/blur/coverage/parallax). | Raise to keep only high-value frames; lower to avoid starvation. |
+| `information_gating` | `weight_depth`, `weight_blur`, `weight_coverage`, `weight_parallax` | Relative weighting of frame usefulness terms. | Rebalance based on failure mode (e.g., more depth weight in low-texture scenes). |
+| `runtime_budgets` | `visual_p95_ms`, `disk_p95_ms`, `main_loop_p95_ms` | p95 latency targets driving adaptive throttling. | Increase only if hardware cannot sustain current targets. |
+| `runtime_budgets` | `queue_pressure_raise`, `queue_pressure_recover` | Queue fill levels for entering/recovering pressure mode. | Lower raise threshold for earlier protection. |
+| `recovery_modes` | `vision_weak_min_frame_gap`, `imu_only_min_frame_gap` | Minimum gap in degraded states. | Increase to shed Pi load faster when unstable. |
+| `recovery_modes` | `imu_only_hold_sec` | How long IMU-only mode is held once triggered. | Increase for stability, decrease for quicker visual re-entry. |
+| `recovery_modes` | `disk_pressure_min_frame_gap`, `disk_pressure_save_stride` | Deterministic disk-pressure throttling strength. | Raise for slow SD/storage media. |
+| `time_sync` | `warn_abs_offset_s`, `warn_drift_s_per_s` | Camera–IMU sync warning sensitivity. | Tighten for high-precision missions; relax if sensor clocks are noisy. |
+| `reconstruction` | `voxel_tracking_m`, `voxel_loop_m` | Downsample voxel sizes for tracking/loop closure clouds. | Increase for speed, decrease for tighter alignment detail. |
+| `reconstruction` | `voxel_tsdf_m` | Final TSDF resolution. | Smaller = better detail + higher memory/runtime. |
+| `reconstruction` | `depth_quantile_pruning` | Prunes far/noisy tail depths before reconstruction. | Lower for aggressive outlier pruning. |
+| `reconstruction` | `loop_closure_interval`, `min_loop_frame_distance`, `loop_top_k` | Loop candidate density and search breadth. | Increase interval/lower top-k for speed; opposite for hard loop closures. |
+| `reconstruction` | `z_regularize` | Post-opt vertical drift smoothing. | Keep on for long underwater passes with weak vertical observability. |
+| `loop_closure_quality` | `max_translation_residual_m`, `max_rotation_residual_deg` | Consistency gates for accepting loops. | Tighten to reduce false loops; loosen if true loops are rejected. |
+| `loop_closure_quality` | `switchable_min_weight`, `min_fgr_fitness` | Minimum loop trust and coarse match quality. | Raise for stricter robustness, lower for difficult low-feature datasets. |
+| `tsdf_quality` | `min_depth_valid_ratio` | Minimum usable depth ratio to integrate a frame. | Raise to protect mesh quality; lower to keep more frames in poor visibility. |
+| `tsdf_quality` | `dynamic_depth_truncation`, `dynamic_trunc_ewma_alpha` | Adaptive depth truncation behavior during fusion. | Enable for varying range scenes; lower alpha for slower/steadier adaptation. |
+| `tsdf_quality` | `max_tracking_rmse_skip` | Skip TSDF frames with poor tracking quality. | Tighten for cleaner mesh, loosen if integration becomes too sparse. |
 
 ### New reliability/quality controls
 

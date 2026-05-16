@@ -42,7 +42,7 @@ cd slam
 ```
 
 ```bash
-# Raspberry Pi 4
+# edge/companion computer (Raspberry pi or Jetson)
 make install-pi
 
 # Station laptop

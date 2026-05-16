@@ -1,1 +1,0 @@
-"""OSVision package."""

@@ -41,24 +41,8 @@ git clone [https://github.com/Marwan7042/slam.git](https://github.com/Marwan7042
 cd slam
 ```
 
-Create a dedicated virtual environment on each machine:
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
-
-Install machine-specific dependencies:
-```bash
-# Raspberry Pi 4 (recording)
-pip install -r requirements-pi.txt
-
-# Station laptop (reconstruction)
-pip install -r requirements-laptop.txt
-```
-
-Or use the included Makefile:
-```bash
-# Raspberry Pi 4
+# edge/companion computer (Raspberry pi or Jetson)
 make install-pi
 
 # Station laptop
@@ -74,8 +58,7 @@ The system operates in two distinct phases: real-time data acquisition and offli
 ### Phase 1: Real-Time VIO (Acquisition)
 Execute this script during ROV operation. It initializes the sensor pipeline, runs the ESKF, and logs the trajectory and gated keyframes to the specified output directory.
 ```bash
-python record.py
-# or: make record
+make record
 ```
 * **Diagnostic Interface:** Navigate to `http://<ROV_IP>:8080/` to access the real-time HUD, monitor EKF health status, and adjust camera parameters (Exposure/ISO/WB).
 * **Terminal Controls:** * `r`: Initiate map recording.
@@ -85,8 +68,7 @@ python record.py
 ### Phase 2: Global Reconstruction (Offline)
 Execute this script post-mission on the host machine to process the acquired dataset, perform loop closure optimization, and extract the 3D mesh.
 ```bash
-python reconstruct.py
-# or: make reconstruct
+make reconstruct
 ```
 * **Output:** `coral_mesh_mm.ply` (Dense 3D point cloud and mesh geometry).
 

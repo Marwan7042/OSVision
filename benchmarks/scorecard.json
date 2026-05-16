@@ -1,0 +1,15 @@
+{
+  "manifest": "/mnt/D/slam/benchmarks/manifest.json",
+  "generated_at_unix": 1778951418.625049,
+  "duration_s": 5.471114873886108,
+  "passed": 0,
+  "failed": 1,
+  "results": [
+    {
+      "name": "default-coral-scan",
+      "scan_dir": "/mnt/D/slam/coral_scan1",
+      "status": "reconstruct_failed",
+      "return_code": 1
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "benchmarks": [
+    {
+      "name": "default-coral-scan",
+      "scan_dir": "./coral_scan1",
+      "is_closed_loop": true,
+      "thresholds": {
+        "max_runtime_s": 1800.0,
+        "max_loop_drift_m": 1.0,
+        "min_loop_precision": 0.03,
+        "min_mesh_vertices": 8000,
+        "min_mesh_triangles": 15000,
+        "min_tsdf_frames": 20
+      }
+    }
+  ]
+}

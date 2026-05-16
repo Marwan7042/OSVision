@@ -8,7 +8,7 @@ RUN := $(VENV)/bin/python
 PIP := $(RUN) -m pip
 endif
 
-.PHONY: venv install-pi install-laptop check record reconstruct
+.PHONY: venv install-pi install-laptop check record reconstruct regression regression-score
 
 venv:
 	$(PYTHON) -m venv $(VENV)
@@ -29,3 +29,9 @@ record:
 
 reconstruct:
 	$(RUN) reconstruct.py
+
+regression:
+	$(RUN) regression_harness.py
+
+regression-score:
+	$(RUN) regression_harness.py --no-run

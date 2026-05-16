@@ -129,7 +129,24 @@ System parameters are defined externally in `config.json`. Key tunables include:
 ### New reliability/quality controls
 
 - `runtime_budgets`: Enforces p95 latency budgets for visual update, disk I/O, and main loop; drives adaptive keyframe gap under backpressure.
+- `recovery_modes`: Explicit degraded-state policies (`VISION_WEAK`, `IMU_ONLY`, `DISK_PRESSURE`) with deterministic throttling/recovery behavior.
 - `time_sync`: Continuously tracks camera-IMU offset/drift and raises sync warnings when thresholds are exceeded.
 - `information_gating`: Adds coverage/parallax-aware keyframe scoring to avoid low-information frames.
 - `loop_closure_quality`: Adds loop consistency gates and switchable loop-edge weighting in pose graph construction.
 - `tsdf_quality`: Rejects low-confidence depth frames and enables dynamic depth truncation during TSDF fusion.
+
+## Regression harness
+
+Run full regression (reconstruct + score):
+```bash
+make regression
+```
+
+Score existing outputs only:
+```bash
+make regression-score
+```
+
+Benchmark list and thresholds are in `benchmarks/manifest.json`. The harness writes `benchmarks/scorecard.json` with pass/fail checks for runtime, loop drift proxy, loop precision, mesh completeness, and TSDF frame coverage.
+
+For non-return trajectories, set `"is_closed_loop": false` in the manifest entry. In that mode, the drift gate is skipped and scoring relies on runtime, loop precision, mesh completeness, and TSDF coverage.

@@ -71,6 +71,15 @@ SYNC_WARN_ABS_S = SYNC_CFG.get("warn_abs_offset_s", 0.030)
 SYNC_WARN_DRIFT_SPS = SYNC_CFG.get("warn_drift_s_per_s", 0.004)
 SYNC_EWMA_ALPHA = SYNC_CFG.get("offset_ewma_alpha", 0.08)
 
+RECOVERY_CFG = CFG.get("recovery_modes", {})
+VISION_WEAK_MIN_GAP = RECOVERY_CFG.get("vision_weak_min_frame_gap", 4)
+IMU_ONLY_MIN_GAP = RECOVERY_CFG.get("imu_only_min_frame_gap", 8)
+IMU_ONLY_HOLD_SEC = RECOVERY_CFG.get("imu_only_hold_sec", 6.0)
+DISK_PRESSURE_MIN_GAP = RECOVERY_CFG.get("disk_pressure_min_frame_gap", 10)
+DISK_PRESSURE_SAVE_STRIDE = max(1, int(RECOVERY_CFG.get("disk_pressure_save_stride", 2)))
+DISK_PRESSURE_QFILL = RECOVERY_CFG.get("disk_pressure_queue_fill", 0.7)
+VISION_WEAK_INFO_BONUS = RECOVERY_CFG.get("vision_weak_info_bonus", 0.08)
+
 CR_CFG = CFG.get("color_restore", {})
 CR_ENABLED = CR_CFG.get("enabled", False)
 CR_R_MAX = CR_CFG.get("r_max_gain", 3.0)
@@ -116,6 +125,7 @@ runtime_state = {"bad_streak_counter": 0}
 adaptive_gate = {"min_frame_gap": int(GATE_MIN_FRAME_GAP)}
 imu_sync = {"last_imu_ts": None, "last_imu_host_ts": None}
 sync_state = {"offset_ewma": None, "drift_ewma": 0.0, "last_cam_ts": None, "last_host_ts": None}
+recovery_state = {"imu_only_until": 0.0}
 lat_lock = threading.Lock()
 latency_samples = {
     "visual_ms": deque(maxlen=600),
@@ -1400,6 +1410,7 @@ with dai.Device(pipeline) as device:
                 if recording_event.is_set() and ekf.is_ready():
                     ekf_frame_counter += 1
                     gap = ekf_frame_counter - last_saved_ekf_idx
+                    active_mode = runtime_mode["mode"]
                     
                     accept = False
                     reason = ""
@@ -1458,11 +1469,17 @@ with dai.Device(pipeline) as device:
                                     feature_cov_score * w_cov +
                                     parallax_score * w_parallax
                                 )
-                                if info_score >= INFO_SCORE_MIN:
+                                info_thr = INFO_SCORE_MIN
+                                if active_mode == "VISION_WEAK":
+                                    info_thr = min(0.95, INFO_SCORE_MIN + VISION_WEAK_INFO_BONUS)
+                                elif active_mode == "IMU_ONLY":
+                                    info_thr = 1.0  # deterministic disable of visual-dependent acceptance
+
+                                if info_score >= info_thr:
                                     accept = True
                                     reason = f"passed_info(I:{info_score:.2f},L:{laplacian_var:.1f},D:{valid_ratio:.2f})"
                                 else:
-                                    reason = f"low_info(I:{info_score:.2f})"
+                                    reason = f"low_info(I:{info_score:.2f},thr:{info_thr:.2f})"
                         evaluated_for_hud = True
 
                     if evaluated_for_hud:
@@ -1515,6 +1532,11 @@ with dai.Device(pipeline) as device:
                                 hud_telemetry["message"] = ""
 
                     if accept:
+                        if active_mode == "DISK_PRESSURE" and (ekf_frame_counter % DISK_PRESSURE_SAVE_STRIDE != 0):
+                            accept = False
+                            reason = f"disk_pressure_stride({DISK_PRESSURE_SAVE_STRIDE})"
+
+                    if accept:
                         ekf.set_keyframe()
                         T, cov6 = ekf.get_pose()
                         Tc = T @ T_ic
@@ -1530,6 +1552,7 @@ with dai.Device(pipeline) as device:
                             "parallax_score": float(parallax_score),
                             "tracked_features": int(n_tracked),
                             "sync_offset_ms": float(hud_telemetry.get("sync_offset_ms", 0.0)),
+                            "recovery_mode": active_mode,
                             "is_forced_gap": is_forced_gap, 
                             "pose": Tc.tolist(),
                             "cov6": cov6.tolist()
@@ -1559,25 +1582,26 @@ with dai.Device(pipeline) as device:
                     ds_curr = depth_dbuf.read() if depth_dbuf else None
 
                     if prev_fd and prev_depth is not None and ekf.is_ready():
-                        pp, pc = [], []
-                        for fid, c in cf.items():
-                            if fid in prev_fd: 
-                                pp.append(prev_fd[fid])
-                                pc.append(c)
-                                
-                        if len(pp) >= MIN_FEAT_UPDATE:
-                            try: 
-                                n_pts = min(len(pp), MAX_FEATURES)
-                                for i in range(n_pts):
-                                    pp_buffer[i, 0] = pp[i][0]
-                                    pp_buffer[i, 1] = pp[i][1]
-                                    pc_buffer[i, 0] = pc[i][0]
-                                    pc_buffer[i, 1] = pc[i][1]
+                        if runtime_mode["mode"] != "IMU_ONLY":
+                            pp, pc = [], []
+                            for fid, c in cf.items():
+                                if fid in prev_fd: 
+                                    pp.append(prev_fd[fid])
+                                    pc.append(c)
                                     
-                                visual_queue.put_nowait((pp_buffer[:n_pts].copy(), pc_buffer[:n_pts].copy(), prev_depth.copy(), prev_ts))
-                            except queue.Full: 
-                                telemetry_stats["visual_queue_drops"] += 1
-                                pass
+                            if len(pp) >= MIN_FEAT_UPDATE:
+                                try: 
+                                    n_pts = min(len(pp), MAX_FEATURES)
+                                    for i in range(n_pts):
+                                        pp_buffer[i, 0] = pp[i][0]
+                                        pp_buffer[i, 1] = pp[i][1]
+                                        pc_buffer[i, 0] = pc[i][0]
+                                        pc_buffer[i, 1] = pc[i][1]
+                                        
+                                    visual_queue.put_nowait((pp_buffer[:n_pts].copy(), pc_buffer[:n_pts].copy(), prev_depth.copy(), prev_ts))
+                                except queue.Full: 
+                                    telemetry_stats["visual_queue_drops"] += 1
+                                    pass
                     
                     prev_fd = cf
                     prev_gray = gray_curr.copy()
@@ -1608,20 +1632,35 @@ with dai.Device(pipeline) as device:
                     dstat["p95"] > DISK_P95_BUDGET_MS or
                     lstat["p95"] > LOOP_P95_BUDGET_MS
                 )
-                if pressure > QUEUE_PRESSURE_RAISE or budget_bad:
-                    adaptive_gate["min_frame_gap"] = min(GATE_MAX_FRAME_GAP, adaptive_gate["min_frame_gap"] + 1)
-                    telemetry_stats["budget_violations"] += 1
-                    mode = "BACKPRESSURE"
-                elif pressure < QUEUE_PRESSURE_RECOVER:
-                    if adaptive_gate["min_frame_gap"] > GATE_MIN_FRAME_GAP:
+                health = ekf.get_visual_health()
+                disk_pressure = (
+                    dq_fill > DISK_PRESSURE_QFILL or
+                    disk_health["consecutive_drops"] >= 2 or
+                    dstat["p95"] > DISK_P95_BUDGET_MS
+                )
+
+                if health["mode"] == "VISION_DEGRADED":
+                    recovery_state["imu_only_until"] = max(
+                        recovery_state["imu_only_until"], now + IMU_ONLY_HOLD_SEC
+                    )
+
+                if disk_pressure:
+                    mode = "DISK_PRESSURE"
+                    adaptive_gate["min_frame_gap"] = max(adaptive_gate["min_frame_gap"], DISK_PRESSURE_MIN_GAP)
+                elif now < recovery_state["imu_only_until"]:
+                    mode = "IMU_ONLY"
+                    adaptive_gate["min_frame_gap"] = max(adaptive_gate["min_frame_gap"], IMU_ONLY_MIN_GAP)
+                elif health["mode"] == "VISION_ADAPTIVE" or vstat["p95"] > VIS_P95_BUDGET_MS or vq_fill > QUEUE_PRESSURE_RAISE:
+                    mode = "VISION_WEAK"
+                    adaptive_gate["min_frame_gap"] = max(adaptive_gate["min_frame_gap"], VISION_WEAK_MIN_GAP)
+                else:
+                    mode = "NOMINAL"
+                    if pressure < QUEUE_PRESSURE_RECOVER and adaptive_gate["min_frame_gap"] > GATE_MIN_FRAME_GAP:
                         adaptive_gate["min_frame_gap"] -= 1
                         telemetry_stats["recovered_from_pressure"] += 1
-                    mode = "NOMINAL"
-                else:
-                    mode = runtime_mode["mode"]
-
-                if abs(sync_state["drift_ewma"]) > SYNC_WARN_DRIFT_SPS:
-                    mode = "SYNC_WARN"
+                    elif pressure > QUEUE_PRESSURE_RAISE or budget_bad:
+                        adaptive_gate["min_frame_gap"] = min(GATE_MAX_FRAME_GAP, adaptive_gate["min_frame_gap"] + 1)
+                        telemetry_stats["budget_violations"] += 1
 
                 runtime_mode["mode"] = mode
                 if mode != mode_last:
@@ -1629,17 +1668,27 @@ with dai.Device(pipeline) as device:
                         "t_monotonic": now,
                         "from": mode_last,
                         "to": mode,
-                        "adaptive_gap": adaptive_gate["min_frame_gap"]
+                        "adaptive_gap": adaptive_gate["min_frame_gap"],
+                        "visual_nis_ema": health.get("nis_ema", 0.0),
+                        "disk_q_fill": dq_fill,
+                        "visual_q_fill": vq_fill,
                     })
                     mode_last = mode
 
                 with hud_lock:
                     hud_telemetry["mode"] = mode
+                    if mode == "DISK_PRESSURE":
+                        hud_telemetry["message"] = "DISK_PRESSURE: throttling saves"
+                    elif mode == "IMU_ONLY":
+                        hud_telemetry["message"] = "IMU_ONLY: visual updates paused"
+                    elif mode == "VISION_WEAK":
+                        hud_telemetry["message"] = "VISION_WEAK: tightening keyframe gate"
 
                 print(
                     f"[BUDGET] mode={mode} gap={adaptive_gate['min_frame_gap']} "
                     f"V(p95={vstat['p95']:.1f}ms) D(p95={dstat['p95']:.1f}ms) "
-                    f"L(p95={lstat['p95']:.1f}ms) q(v={vq_fill:.2f},d={dq_fill:.2f})"
+                    f"L(p95={lstat['p95']:.1f}ms) q(v={vq_fill:.2f},d={dq_fill:.2f}) "
+                    f"NIS={health.get('nis_ema', 0.0):.2f}"
                 )
                 last_budget_report = now
 

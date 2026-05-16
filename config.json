@@ -35,6 +35,15 @@
         "queue_pressure_raise": 0.7,
         "queue_pressure_recover": 0.35
     },
+    "recovery_modes": {
+        "vision_weak_min_frame_gap": 4,
+        "imu_only_min_frame_gap": 8,
+        "imu_only_hold_sec": 6.0,
+        "disk_pressure_min_frame_gap": 10,
+        "disk_pressure_save_stride": 2,
+        "disk_pressure_queue_fill": 0.7,
+        "vision_weak_info_bonus": 0.08
+    },
     "time_sync": {
         "warn_abs_offset_s": 0.03,
         "warn_drift_s_per_s": 0.004,

@@ -125,3 +125,11 @@ System parameters are defined externally in `config.json`. Key tunables include:
 | `weight_depth` / `weight_blur`| Quality scoring weights for keyframe selection. |
 | `voxel_tsdf_m` | Volumetric resolution of the final 3D mesh (e.g., `0.005` = 5mm). |
 ```
+
+### New reliability/quality controls
+
+- `runtime_budgets`: Enforces p95 latency budgets for visual update, disk I/O, and main loop; drives adaptive keyframe gap under backpressure.
+- `time_sync`: Continuously tracks camera-IMU offset/drift and raises sync warnings when thresholds are exceeded.
+- `information_gating`: Adds coverage/parallax-aware keyframe scoring to avoid low-information frames.
+- `loop_closure_quality`: Adds loop consistency gates and switchable loop-edge weighting in pose graph construction.
+- `tsdf_quality`: Rejects low-confidence depth frames and enables dynamic depth truncation during TSDF fusion.

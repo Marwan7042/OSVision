@@ -124,6 +124,18 @@ Z_REGULARIZE            = CFG["reconstruction"]["z_regularize"]
 MIN_CLOUD_PTS           = CFG["reconstruction"]["min_cloud_points"]
 LOOP_TOP_K              = CFG["reconstruction"]["loop_top_k"]
 
+LOOP_CFG = CFG.get("loop_closure_quality", {})
+LOOP_MAX_TRANS_RESIDUAL_M = LOOP_CFG.get("max_translation_residual_m", 1.2)
+LOOP_MAX_ROT_RESIDUAL_DEG = LOOP_CFG.get("max_rotation_residual_deg", 35.0)
+LOOP_SWITCHABLE_MIN_WEIGHT = LOOP_CFG.get("switchable_min_weight", 0.20)
+LOOP_MIN_FGR_FITNESS = LOOP_CFG.get("min_fgr_fitness", 0.08)
+
+TSDF_Q_CFG = CFG.get("tsdf_quality", {})
+TSDF_MIN_DEPTH_VALID_RATIO = TSDF_Q_CFG.get("min_depth_valid_ratio", 0.12)
+TSDF_DYNAMIC_TRUNC = TSDF_Q_CFG.get("dynamic_depth_truncation", True)
+TSDF_DYNAMIC_ALPHA = TSDF_Q_CFG.get("dynamic_trunc_ewma_alpha", 0.15)
+TSDF_MAX_TRACKING_ERROR_SKIP = TSDF_Q_CFG.get("max_tracking_rmse_skip", 0.18)
+
 VOXEL_TSDF_BASE = CFG["reconstruction"]["voxel_tsdf_m"]
 HAS_CUDA = o3c.cuda.is_available()
 GPU_DEVICE = o3c.Device("CUDA:0") if HAS_CUDA else o3c.Device("CPU:0")
@@ -466,6 +478,20 @@ def norm_info(raw, trust):
         return np.eye(6) * trust
     return raw * (6.0 / tr) * trust
 
+def _rot_angle_deg(R):
+    val = (np.trace(R) - 1.0) * 0.5
+    val = float(np.clip(val, -1.0, 1.0))
+    return float(np.degrees(np.arccos(val)))
+
+def _loop_switch_weight(T_meas, T_pred):
+    dT = np.linalg.inv(T_pred) @ T_meas
+    trans = float(np.linalg.norm(dT[:3, 3]))
+    rot = _rot_angle_deg(dT[:3, :3])
+    wt_t = 1.0 / (1.0 + (trans / max(1e-6, LOOP_MAX_TRANS_RESIDUAL_M)) ** 2)
+    wt_r = 1.0 / (1.0 + (rot / max(1e-6, LOOP_MAX_ROT_RESIDUAL_DEG)) ** 2)
+    w = float(np.clip(wt_t * wt_r, 0.0, 1.0))
+    return w, trans, rot
+
 def compute_cloud_distinctiveness(pcd):
     if pcd is None or not pcd.has_normals():
         return 0.5
@@ -733,6 +759,7 @@ icp_ok = 0
 icp_fail = 0
 fitness_log = []
 edge_data = []
+tracking_rmse = np.full(n_frames, np.inf, dtype=np.float64)
 
 eta1 = ETA(n_frames - 1, "ICP-P1", 50)
 
@@ -788,6 +815,7 @@ for i in range(_start + 1, n_frames):
             pass
 
     edge_data.append((T_rel, fit, rmse, ok, dist, info_mat))
+    tracking_rmse[i] = float(rmse) if np.isfinite(rmse) else np.inf
 
     if ok: 
         icp_ok += 1
@@ -864,6 +892,7 @@ print(f"  ICP radius   : {ICP_DIST_LOOP*1000:.0f}mm (auto-scales with true gaps)
 print(f"  ICP cascade  : {ICP_LOOP_SCALES}")
 print(f"  Spatial gate : {SPATIAL_GATE:.2f}m")
 print(f"  Top-K Eval   : {LOOP_TOP_K} closest frames")
+print(f"  Consistency  : dT<{LOOP_MAX_TRANS_RESIDUAL_M:.2f}m dR<{LOOP_MAX_ROT_RESIDUAL_DEG:.1f}deg")
 print(f"  [{mem()}]")
 print(f"{'='*60}")
 
@@ -895,7 +924,7 @@ def eval_candidate(i, ti, sd, sd_fpfh, sd_dist, dyn_dist):
                 maximum_correspondence_distance=dyn_dist * 2.0
             )
         )
-        if fgr_result.fitness > 0.1:
+        if fgr_result.fitness > LOOP_MIN_FGR_FITNESS:
             T_init = fgr_result.transformation
         else:
             T_init = np.linalg.inv(imu_poses[ti]) @ imu_poses[i]
@@ -905,11 +934,28 @@ def eval_candidate(i, ti, sd, sd_fpfh, sd_dist, dyn_dist):
     T_icp, fit, rmse = loop_icp(sd, td, dyn_dist, T_init)
 
     if fit > ICP_FIT_ACCEPT and rmse < ICP_RMSE_ACCEPT:
+        T_pred = np.linalg.inv(imu_poses[ti]) @ imu_poses[i]
+        switch_w, t_residual, r_residual_deg = _loop_switch_weight(T_icp, T_pred)
+        if (
+            t_residual > LOOP_MAX_TRANS_RESIDUAL_M * 2.0 or
+            r_residual_deg > LOOP_MAX_ROT_RESIDUAL_DEG * 2.0 or
+            switch_w < LOOP_SWITCHABLE_MIN_WEIGHT
+        ):
+            return None
         raw = np.asarray(o3d.pipelines.registration.get_information_matrix_from_point_clouds(
             sd, td, dyn_dist, T_icp
         ))
         if np.trace(raw) > 1e-6: 
-            return (ti, T_icp, norm_info(raw, LOOP_TRUST), fit, rmse)
+            return (
+                ti,
+                T_icp,
+                norm_info(raw, LOOP_TRUST * switch_w),
+                fit,
+                rmse,
+                switch_w,
+                t_residual,
+                r_residual_deg,
+            )
             
     return None
 
@@ -959,12 +1005,15 @@ with ThreadPoolExecutor(max_workers=_phys) as pool:
         for fut in as_completed(futures):
             res = fut.result()
             if res is not None:
-                ti_match, T_icp, info, fit, rmse = res
+                ti_match, T_icp, info, fit, rmse, switch_w, t_res, r_res = res
                 graph.edges.append(o3d.pipelines.registration.PoseGraphEdge(
                     i, ti_match, T_icp, info, uncertain=True
                 ))
                 n_loops += 1
-                print(f"  Loop: {i:4d}→{ti_match:4d} fit={fit:.3f} rmse={rmse:.4f}")
+                print(
+                    f"  Loop: {i:4d}→{ti_match:4d} fit={fit:.3f} rmse={rmse:.4f} "
+                    f"w={switch_w:.2f} dT={t_res:.2f}m dR={r_res:.1f}deg"
+                )
                 
                 if not ALLOW_MULTI_LOOPS:
                     for f in futures: 
@@ -1100,8 +1149,17 @@ gc.collect()
 # ============================================================
 # PHASE 4: TSDF (ASYNC DOUBLE-BUFFERED & QUARANTINED)
 # ============================================================
-fi = [i for i in range(0, n_frames, TSDF_STEP) if quality_states[i] != "BAD"]
-skipped_bad = len(range(0, n_frames, TSDF_STEP)) - len(fi)
+fi = []
+skipped_bad = 0
+skipped_tracking = 0
+for i in range(0, n_frames, TSDF_STEP):
+    if quality_states[i] == "BAD":
+        skipped_bad += 1
+        continue
+    if np.isfinite(tracking_rmse[i]) and tracking_rmse[i] > TSDF_MAX_TRACKING_ERROR_SKIP:
+        skipped_tracking += 1
+        continue
+    fi.append(i)
 
 if not fi:
     print(f"\n⚠ [FATAL] All {len(range(0, n_frames, TSDF_STEP))} sampled TSDF frames were quarantined as 'BAD'.")
@@ -1112,12 +1170,15 @@ print(f"\n{'='*60}")
 print(f"PHASE 4: TSDF  [{TSDF_MODE}] (Double-Buffered Integration)")
 print(f"  Voxel: {VOXEL_TSDF*1000:.0f}mm | SDF: {SDF_TRUNC*1000:.0f}mm | Depth trunc: {DEPTH_TRUNC:.2f}m")
 print(f"  Quarantined: {skipped_bad} BAD frames skipped")
+print(f"  Tracking-gated: {skipped_tracking} high-RMSE frames skipped")
 print(f"  [{mem()}]")
 print(f"{'='*60}")
 
 inv_ext = {i: np.linalg.inv(graph.nodes[i].pose) for i in fi}
 eta4 = ETA(len(fi), "TSDF", 30)
 t4   = time.perf_counter()
+depth_trunc_dyn = DEPTH_TRUNC
+tsdf_depth_reject = 0
 
 tsdf_exec = ThreadPoolExecutor(max_workers=2)
 
@@ -1152,18 +1213,29 @@ if HAS_CUDA:
         if color is not None and depth is not None:
             # FIX: Depth uncertainty weighting
             depth_weighted = apply_depth_uncertainty(np.asarray(depth), DEPTH_TRUNC)
+            valid_mask = depth_weighted > 0
+            valid_ratio = float(np.count_nonzero(valid_mask)) / float(depth_weighted.size)
+            if valid_ratio < TSDF_MIN_DEPTH_VALID_RATIO:
+                tsdf_depth_reject += 1
+                eta4.tick()
+                continue
+            if TSDF_DYNAMIC_TRUNC:
+                valid_depth = depth_weighted[valid_mask] / DEPTH_SCALE
+                if valid_depth.size > 50:
+                    frame_trunc = float(np.clip(np.percentile(valid_depth, 95) + DEPTH_TRUNC_PADDING, 0.5, 5.0))
+                    depth_trunc_dyn = (1.0 - TSDF_DYNAMIC_ALPHA) * depth_trunc_dyn + TSDF_DYNAMIC_ALPHA * frame_trunc
 
             dt = o3d.t.geometry.Image(depth_weighted).to(GPU_DEVICE)
             ct = o3d.t.geometry.Image(np.asarray(color)).to(GPU_DEVICE)
             et = o3c.Tensor(inv_ext[i], dtype=o3c.Dtype.Float64, device=GPU_DEVICE)
 
             fb = vbg.compute_unique_block_coordinates(
-                dt, intr_t, et, depth_scale=DEPTH_SCALE, depth_max=DEPTH_TRUNC
+                dt, intr_t, et, depth_scale=DEPTH_SCALE, depth_max=depth_trunc_dyn
             )
                 
             vbg.integrate(
                 fb, dt, ct, intr_t, et,
-                depth_scale=DEPTH_SCALE, depth_max=DEPTH_TRUNC,
+                depth_scale=DEPTH_SCALE, depth_max=depth_trunc_dyn,
                 trunc_voxel_multiplier=SDF_TRUNC/VOXEL_TSDF
             )
             
@@ -1207,9 +1279,20 @@ else:
         if color is not None and depth is not None:
             # FIX: Depth uncertainty weighting
             depth_weighted = apply_depth_uncertainty(np.asarray(depth), DEPTH_TRUNC)
+            valid_mask = depth_weighted > 0
+            valid_ratio = float(np.count_nonzero(valid_mask)) / float(depth_weighted.size)
+            if valid_ratio < TSDF_MIN_DEPTH_VALID_RATIO:
+                tsdf_depth_reject += 1
+                eta4.tick()
+                continue
+            if TSDF_DYNAMIC_TRUNC:
+                valid_depth = depth_weighted[valid_mask] / DEPTH_SCALE
+                if valid_depth.size > 50:
+                    frame_trunc = float(np.clip(np.percentile(valid_depth, 95) + DEPTH_TRUNC_PADDING, 0.5, 5.0))
+                    depth_trunc_dyn = (1.0 - TSDF_DYNAMIC_ALPHA) * depth_trunc_dyn + TSDF_DYNAMIC_ALPHA * frame_trunc
 
             rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
-                color, o3d.geometry.Image(depth_weighted), depth_scale=DEPTH_SCALE, depth_trunc=DEPTH_TRUNC,
+                color, o3d.geometry.Image(depth_weighted), depth_scale=DEPTH_SCALE, depth_trunc=depth_trunc_dyn,
                 convert_rgb_to_intensity=False
             )
             vol.integrate(rgbd, intr_leg, inv_ext[i])
@@ -1295,7 +1378,11 @@ metrics_data = {
     },
     "phase_4_tsdf": {
         "frames_integrated": len(fi),
-        "frames_quarantined": skipped_bad
+        "frames_quarantined_bad": skipped_bad,
+        "frames_quarantined_tracking": skipped_tracking,
+        "frames_quarantined_depth_confidence": tsdf_depth_reject,
+        "dynamic_depth_truncation": TSDF_DYNAMIC_TRUNC,
+        "final_depth_trunc_m": float(depth_trunc_dyn)
     },
     "phase_5_mesh": {
         "vertices": nv,

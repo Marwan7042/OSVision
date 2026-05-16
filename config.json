@@ -20,6 +20,26 @@
         "min_depth_valid_ratio": 0.25,
         "max_blur_pixels": 5.0
     },
+    "information_gating": {
+        "min_information_score": 0.45,
+        "weight_depth": 0.4,
+        "weight_blur": 0.25,
+        "weight_coverage": 0.2,
+        "weight_parallax": 0.15
+    },
+    "runtime_budgets": {
+        "visual_p95_ms": 22.0,
+        "disk_p95_ms": 14.0,
+        "main_loop_p95_ms": 35.0,
+        "report_interval_sec": 8.0,
+        "queue_pressure_raise": 0.7,
+        "queue_pressure_recover": 0.35
+    },
+    "time_sync": {
+        "warn_abs_offset_s": 0.03,
+        "warn_drift_s_per_s": 0.004,
+        "offset_ewma_alpha": 0.08
+    },
     "color_restore": {
         "enabled": true,
         "r_max_gain": 3.0,
@@ -54,5 +74,17 @@
         "loop_top_k": 3,
         "z_regularize": true,
         "min_cloud_points": 200
+    },
+    "loop_closure_quality": {
+        "max_translation_residual_m": 1.2,
+        "max_rotation_residual_deg": 35.0,
+        "switchable_min_weight": 0.2,
+        "min_fgr_fitness": 0.08
+    },
+    "tsdf_quality": {
+        "min_depth_valid_ratio": 0.12,
+        "dynamic_depth_truncation": true,
+        "dynamic_trunc_ewma_alpha": 0.15,
+        "max_tracking_rmse_skip": 0.18
     }
 }

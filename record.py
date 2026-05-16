@@ -7,6 +7,7 @@ import depthai as dai
 import cv2
 import numpy as np
 import os, json, time, threading, queue
+from collections import deque
 from datetime import timedelta
 import sys, select, termios, tty
 import math
@@ -48,12 +49,27 @@ LAPLACIAN_PASS_THRESHOLD = 50.0
 QC_CFG = CFG.get("quality_control", {})
 TARGET_SCORE_GOOD = QC_CFG.get("score_good_threshold", 0.75)
 TARGET_DEPTH_PCT = QC_CFG.get("ideal_depth_ratio", 0.40) * 100.0
+INFO_CFG = CFG.get("information_gating", {})
+INFO_SCORE_MIN = INFO_CFG.get("min_information_score", 0.45)
 
 STATIC_VAR_THR   = CFG["ekf_tuning"]["static_variance_threshold"]
 MIN_GRAV_SAMPLES = CFG["ekf_tuning"]["min_gravity_samples"]
 MIN_FEAT_UPDATE  = CFG["ekf_tuning"]["min_feature_update"]
 DEPTH_MIN_MM     = CFG["ekf_tuning"]["depth_min_mm"]
 DEPTH_MAX_MM     = CFG["ekf_tuning"]["depth_max_mm"]
+
+BUDGET_CFG = CFG.get("runtime_budgets", {})
+VIS_P95_BUDGET_MS = BUDGET_CFG.get("visual_p95_ms", 22.0)
+DISK_P95_BUDGET_MS = BUDGET_CFG.get("disk_p95_ms", 14.0)
+LOOP_P95_BUDGET_MS = BUDGET_CFG.get("main_loop_p95_ms", 35.0)
+BUDGET_REPORT_SEC = BUDGET_CFG.get("report_interval_sec", 8.0)
+QUEUE_PRESSURE_RAISE = BUDGET_CFG.get("queue_pressure_raise", 0.70)
+QUEUE_PRESSURE_RECOVER = BUDGET_CFG.get("queue_pressure_recover", 0.35)
+
+SYNC_CFG = CFG.get("time_sync", {})
+SYNC_WARN_ABS_S = SYNC_CFG.get("warn_abs_offset_s", 0.030)
+SYNC_WARN_DRIFT_SPS = SYNC_CFG.get("warn_drift_s_per_s", 0.004)
+SYNC_EWMA_ALPHA = SYNC_CFG.get("offset_ewma_alpha", 0.08)
 
 CR_CFG = CFG.get("color_restore", {})
 CR_ENABLED = CR_CFG.get("enabled", False)
@@ -88,10 +104,65 @@ hud_telemetry = {
     "score": 1.0,
     "blur": 0.0,
     "depth_pct": 0.0,
-    "message": "AWAITING GRAVITY CALIBRATION"
+    "message": "AWAITING GRAVITY CALIBRATION",
+    "mode": "BOOT",
+    "visual_nis": 0.0,
+    "sync_offset_ms": 0.0,
+    "sync_drift_ms_s": 0.0,
+    "adaptive_gap": GATE_MIN_FRAME_GAP
 }
 hud_lock = threading.Lock()
-runtime_state = {"bad_streak_counter": 0} 
+runtime_state = {"bad_streak_counter": 0}
+adaptive_gate = {"min_frame_gap": int(GATE_MIN_FRAME_GAP)}
+imu_sync = {"last_imu_ts": None, "last_imu_host_ts": None}
+sync_state = {"offset_ewma": None, "drift_ewma": 0.0, "last_cam_ts": None, "last_host_ts": None}
+lat_lock = threading.Lock()
+latency_samples = {
+    "visual_ms": deque(maxlen=600),
+    "disk_ms": deque(maxlen=800),
+    "main_loop_ms": deque(maxlen=600),
+}
+runtime_mode = {"mode": "BOOT"}
+
+def _observe_latency(key, value_ms):
+    with lat_lock:
+        latency_samples[key].append(float(value_ms))
+
+def _latency_percentiles(key):
+    with lat_lock:
+        arr = np.array(latency_samples[key], dtype=np.float64)
+    if arr.size == 0:
+        return {"count": 0, "p50": 0.0, "p95": 0.0, "p99": 0.0}
+    return {
+        "count": int(arr.size),
+        "p50": float(np.percentile(arr, 50)),
+        "p95": float(np.percentile(arr, 95)),
+        "p99": float(np.percentile(arr, 99)),
+    }
+
+def _feature_coverage_score(features, width, height):
+    if not features:
+        return 0.0
+    xs = [f.position.x for f in features]
+    ys = [f.position.y for f in features]
+    if len(xs) < 4:
+        return 0.0
+    spread = (max(xs) - min(xs)) * (max(ys) - min(ys))
+    return float(np.clip(spread / float(width * height), 0.0, 1.0))
+
+def _parallax_score(curr_fd, prev_fd):
+    if not curr_fd or not prev_fd:
+        return 0.0
+    shared = [fid for fid in curr_fd.keys() if fid in prev_fd]
+    if len(shared) < 8:
+        return 0.0
+    disp = []
+    for fid in shared:
+        p0 = prev_fd[fid]
+        p1 = curr_fd[fid]
+        disp.append(math.hypot(p1[0] - p0[0], p1[1] - p0[1]))
+    med = float(np.median(np.array(disp, dtype=np.float64)))
+    return float(np.clip(med / 20.0, 0.0, 1.0))
 
 # ============================================================
 # ZERO-COPY BUFFERS
@@ -124,10 +195,17 @@ def visual_worker(ekf, K_mat, T_ic, T_ci):
             
         if item is None: 
             break
-            
+
+        t0 = time.perf_counter()
         r, n = ekf.update_visual(item[0], item[1], item[2], K_mat, T_ic, T_ci, item[3])
+        _observe_latency("visual_ms", (time.perf_counter() - t0) * 1000.0)
         if r: ok += 1
         else: fail += 1
+
+        health = ekf.get_visual_health()
+        with hud_lock:
+            hud_telemetry["visual_nis"] = float(health.get("nis_ema", 0.0))
+            hud_telemetry["mode"] = health.get("mode", runtime_mode["mode"])
         visual_queue.task_done()
 
 def imu_worker(device, ekf):
@@ -152,6 +230,8 @@ def imu_worker(device, ekf):
                     ab[0], ab[1], ab[2] = a.x, a.y, a.z
                     gb[0], gb[1], gb[2] = g.x, g.y, g.z
                     ekf.feed_imu(ab, gb, ts)
+                    imu_sync["last_imu_ts"] = float(ts)
+                    imu_sync["last_imu_host_ts"] = time.monotonic()
             else:
                 time.sleep(0.001)
         except Exception as e:
@@ -946,6 +1026,7 @@ def disk_worker():
             item = disk_queue.get(timeout=0.1)
             if item is None: break
             filepath, img = item[0], item[1]
+            t0 = time.perf_counter()
             
             # Save raw Depth maps to .u16 Binary Array (Bypasses PNG compression CPU load)
             if filepath.endswith('.png'):
@@ -953,7 +1034,7 @@ def disk_worker():
                 img.tofile(filepath)
             else:
                 cv2.imwrite(filepath, img, [cv2.IMWRITE_JPEG_QUALITY, 75])
-            
+            _observe_latency("disk_ms", (time.perf_counter() - t0) * 1000.0)
             disk_queue.task_done()
         except queue.Empty: 
             continue
@@ -1188,11 +1269,18 @@ with dai.Device(pipeline) as device:
     telemetry_stats = {
         "visual_queue_drops": 0,
         "disk_queue_drops": 0,
-        "forced_gaps_accepted": 0
+        "forced_gaps_accepted": 0,
+        "sync_warnings": 0,
+        "budget_violations": 0,
+        "mode_transitions": [],
+        "recovered_from_pressure": 0
     }
+    last_budget_report = time.monotonic()
+    mode_last = "BOOT"
 
     try:
         while True:
+            loop_t0 = time.perf_counter()
             with cam_ctrl_lock:
                 target_wb = cam_state["wb"]
                 target_exp = cam_state["exp"]
@@ -1251,6 +1339,33 @@ with dai.Device(pipeline) as device:
                 
                 try: rgb_ts = sy["rgb"].getTimestamp().total_seconds()
                 except AttributeError: rgb_ts = time.monotonic()
+                host_ts = time.monotonic()
+
+                # Continuous camera/IMU time-offset and drift estimation.
+                imu_ts = imu_sync["last_imu_ts"]
+                if imu_ts is not None:
+                    offset = float(rgb_ts - imu_ts)
+                    prev_offset = sync_state["offset_ewma"]
+                    if prev_offset is None:
+                        sync_state["offset_ewma"] = offset
+                    else:
+                        sync_state["offset_ewma"] = (1.0 - SYNC_EWMA_ALPHA) * prev_offset + SYNC_EWMA_ALPHA * offset
+                    if sync_state["last_cam_ts"] is not None and sync_state["last_host_ts"] is not None:
+                        dt_host = max(1e-6, host_ts - sync_state["last_host_ts"])
+                        drift = (offset - (prev_offset if prev_offset is not None else offset)) / dt_host
+                        sync_state["drift_ewma"] = 0.9 * sync_state["drift_ewma"] + 0.1 * drift
+                    sync_state["last_cam_ts"] = rgb_ts
+                    sync_state["last_host_ts"] = host_ts
+
+                    warn_sync = (
+                        abs(sync_state["offset_ewma"]) > SYNC_WARN_ABS_S or
+                        abs(sync_state["drift_ewma"]) > SYNC_WARN_DRIFT_SPS
+                    )
+                    if warn_sync:
+                        telemetry_stats["sync_warnings"] += 1
+                    with hud_lock:
+                        hud_telemetry["sync_offset_ms"] = float(sync_state["offset_ewma"] * 1000.0)
+                        hud_telemetry["sync_drift_ms_s"] = float(sync_state["drift_ewma"] * 1000.0)
                 
                 # Zero-Math Grayscale: Extracting the Green channel directly
                 gray_curr = raw_rgb[:, :, 1].copy()
@@ -1294,6 +1409,17 @@ with dai.Device(pipeline) as device:
                     
                     quality_score = 1.0       
                     quality_state = "GOOD"
+                    info_score = 0.0
+                    feature_cov_score = 0.0
+                    parallax_score = 0.0
+                    n_tracked = 0
+
+                    if fm:
+                        tracked = fm.trackedFeatures
+                        n_tracked = len(tracked)
+                        feature_cov_score = _feature_coverage_score(tracked, raw_rgb.shape[1], raw_rgb.shape[0])
+                        cf_tmp = {t.id: (float(t.position.x), float(t.position.y)) for t in tracked}
+                        parallax_score = _parallax_score(cf_tmp, prev_fd)
                     
                     # Optimized Temporal Gradient (Laplacian Variance) on center ROI to avoid downsampling aliasing
                     h_g, w_g = gray_curr.shape
@@ -1308,7 +1434,7 @@ with dai.Device(pipeline) as device:
                         valid_ratio = float(np.count_nonzero(dep)) / dep.size
                         evaluated_for_hud = True
                         
-                    elif gap >= GATE_MIN_FRAME_GAP:
+                    elif gap >= adaptive_gate["min_frame_gap"]:
                         valid_ratio = float(np.count_nonzero(dep)) / dep.size
                         if valid_ratio < GATE_MIN_DEPTH_VALID:
                             reason = f"bad_depth({valid_ratio:.2f})"
@@ -1316,8 +1442,27 @@ with dai.Device(pipeline) as device:
                             if laplacian_var < LAPLACIAN_PASS_THRESHOLD:
                                 reason = f"blur_laplacian({laplacian_var:.1f})"
                             else:
-                                accept = True
-                                reason = f"passed_gate(L:{laplacian_var:.1f},D:{valid_ratio:.2f})"
+                                # Information-aware gating: depth + blur + coverage + parallax.
+                                qc_cfg = CFG.get("quality_control", {})
+                                ideal_depth = qc_cfg.get("ideal_depth_ratio", 0.40)
+                                severe_blur_equiv = qc_cfg.get("severe_blur_px", 10.0)
+                                w_depth = INFO_CFG.get("weight_depth", 0.40)
+                                w_blur = INFO_CFG.get("weight_blur", 0.25)
+                                w_cov = INFO_CFG.get("weight_coverage", 0.20)
+                                w_parallax = INFO_CFG.get("weight_parallax", 0.15)
+                                q_depth = min(1.0, valid_ratio / ideal_depth) if ideal_depth > 0 else 0.0
+                                q_blur = min(1.0, max(0.0, (laplacian_var - severe_blur_equiv) / 100.0))
+                                info_score = (
+                                    q_depth * w_depth +
+                                    q_blur * w_blur +
+                                    feature_cov_score * w_cov +
+                                    parallax_score * w_parallax
+                                )
+                                if info_score >= INFO_SCORE_MIN:
+                                    accept = True
+                                    reason = f"passed_info(I:{info_score:.2f},L:{laplacian_var:.1f},D:{valid_ratio:.2f})"
+                                else:
+                                    reason = f"low_info(I:{info_score:.2f})"
                         evaluated_for_hud = True
 
                     if evaluated_for_hud:
@@ -1333,7 +1478,8 @@ with dai.Device(pipeline) as device:
                         q_depth = min(1.0, valid_ratio / ideal_depth) if ideal_depth > 0 else 0
                         q_blur  = min(1.0, max(0.0, (laplacian_var - severe_blur_equiv) / 100.0))
                         quality_score = (q_depth * w_depth) + (q_blur * w_blur)
-                        
+                        if info_score > 0.0:
+                            quality_score = 0.7 * quality_score + 0.3 * info_score
                         if is_forced_gap:
                             quality_state = "WEAK"
                             quality_score = min(quality_score, weak_thresh)
@@ -1354,6 +1500,7 @@ with dai.Device(pipeline) as device:
                             hud_telemetry["score"] = quality_score
                             hud_telemetry["blur"] = laplacian_var 
                             hud_telemetry["depth_pct"] = valid_ratio
+                            hud_telemetry["adaptive_gap"] = adaptive_gate["min_frame_gap"]
                             
                             if runtime_state["bad_streak_counter"] >= 8:
                                 hud_telemetry["message"] = "CRITICAL: REVERSE TO LAST GOOD VIEW!"
@@ -1378,6 +1525,11 @@ with dai.Device(pipeline) as device:
                             "gate_reason": reason,
                             "quality_score": float(quality_score),
                             "quality_state": quality_state,
+                            "information_score": float(info_score),
+                            "feature_coverage_score": float(feature_cov_score),
+                            "parallax_score": float(parallax_score),
+                            "tracked_features": int(n_tracked),
+                            "sync_offset_ms": float(hud_telemetry.get("sync_offset_ms", 0.0)),
                             "is_forced_gap": is_forced_gap, 
                             "pose": Tc.tolist(),
                             "cov6": cov6.tolist()
@@ -1429,7 +1581,11 @@ with dai.Device(pipeline) as device:
                     
                     prev_fd = cf
                     prev_gray = gray_curr.copy()
-                    prev_ts = rgb_ts
+                    # Use offset-compensated camera timestamp for visual update timing.
+                    if sync_state["offset_ewma"] is not None:
+                        prev_ts = rgb_ts - sync_state["offset_ewma"]
+                    else:
+                        prev_ts = rgb_ts
                     
                     if ds_curr is not None:
                         valid_ratio = float(np.count_nonzero(ds_curr)) / ds_curr.size
@@ -1437,6 +1593,55 @@ with dai.Device(pipeline) as device:
                             prev_depth = ds_curr.copy()
 
             time.sleep(0.001)
+
+            _observe_latency("main_loop_ms", (time.perf_counter() - loop_t0) * 1000.0)
+            now = time.monotonic()
+            if now - last_budget_report >= BUDGET_REPORT_SEC:
+                vstat = _latency_percentiles("visual_ms")
+                dstat = _latency_percentiles("disk_ms")
+                lstat = _latency_percentiles("main_loop_ms")
+                vq_fill = visual_queue.qsize() / float(max(1, visual_queue.maxsize))
+                dq_fill = disk_queue.qsize() / float(max(1, disk_queue.maxsize))
+                pressure = max(vq_fill, dq_fill)
+                budget_bad = (
+                    vstat["p95"] > VIS_P95_BUDGET_MS or
+                    dstat["p95"] > DISK_P95_BUDGET_MS or
+                    lstat["p95"] > LOOP_P95_BUDGET_MS
+                )
+                if pressure > QUEUE_PRESSURE_RAISE or budget_bad:
+                    adaptive_gate["min_frame_gap"] = min(GATE_MAX_FRAME_GAP, adaptive_gate["min_frame_gap"] + 1)
+                    telemetry_stats["budget_violations"] += 1
+                    mode = "BACKPRESSURE"
+                elif pressure < QUEUE_PRESSURE_RECOVER:
+                    if adaptive_gate["min_frame_gap"] > GATE_MIN_FRAME_GAP:
+                        adaptive_gate["min_frame_gap"] -= 1
+                        telemetry_stats["recovered_from_pressure"] += 1
+                    mode = "NOMINAL"
+                else:
+                    mode = runtime_mode["mode"]
+
+                if abs(sync_state["drift_ewma"]) > SYNC_WARN_DRIFT_SPS:
+                    mode = "SYNC_WARN"
+
+                runtime_mode["mode"] = mode
+                if mode != mode_last:
+                    telemetry_stats["mode_transitions"].append({
+                        "t_monotonic": now,
+                        "from": mode_last,
+                        "to": mode,
+                        "adaptive_gap": adaptive_gate["min_frame_gap"]
+                    })
+                    mode_last = mode
+
+                with hud_lock:
+                    hud_telemetry["mode"] = mode
+
+                print(
+                    f"[BUDGET] mode={mode} gap={adaptive_gate['min_frame_gap']} "
+                    f"V(p95={vstat['p95']:.1f}ms) D(p95={dstat['p95']:.1f}ms) "
+                    f"L(p95={lstat['p95']:.1f}ms) q(v={vq_fill:.2f},d={dq_fill:.2f})"
+                )
+                last_budget_report = now
 
     except KeyboardInterrupt:
         print("\n[STOP]")
@@ -1471,6 +1676,18 @@ with dai.Device(pipeline) as device:
             json.dump(ekf.residual_log, f, indent=2)
             
         telem_file = os.path.join(SAVE_DIR, "session_telemetry.json")
+        telemetry_stats["latency_summary_ms"] = {
+            "visual": _latency_percentiles("visual_ms"),
+            "disk": _latency_percentiles("disk_ms"),
+            "main_loop": _latency_percentiles("main_loop_ms"),
+        }
+        telemetry_stats["final_adaptive_gap"] = adaptive_gate["min_frame_gap"]
+        telemetry_stats["final_mode"] = runtime_mode["mode"]
+        telemetry_stats["sync"] = {
+            "offset_ms": float((sync_state["offset_ewma"] or 0.0) * 1000.0),
+            "drift_ms_per_s": float(sync_state["drift_ewma"] * 1000.0),
+        }
+        telemetry_stats["ekf_visual_health"] = ekf.get_visual_health()
         with open(telem_file, "w") as f:
             json.dump(telemetry_stats, f, indent=2)
             

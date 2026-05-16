@@ -45,6 +45,8 @@ GYRO_ND  = _BASE_GYRO_ND * VIB_MULTIPLIER
 VIS_NOISE_P   = (0.010)**2
 VIS_NOISE_PHI = (np.deg2rad(1.0))**2
 REORTHO_INTERVAL = 500
+VIS_NIS_CHI2_95 = 12.592
+VIS_NIS_CHI2_99 = 16.812
 
 # ============================================================
 # NUMBA JIT KERNELS (Preserving your custom optimizations)
@@ -224,6 +226,12 @@ class VIO_EKF:
         self.pre_dt = 0.0
         self._last_vis_cam_pose = None
         self._last_vis_ts = None
+        self._vis_noise_scale = 1.0
+        self._vis_reject_streak = 0
+        self._vis_accept_count = 0
+        self._vis_reject_count = 0
+        self._vis_nis_ema = 0.0
+        self._vis_last_nis = 0.0
 
     def feed_imu(self, a, g, ts):
         with self._lock: 
@@ -329,6 +337,24 @@ class VIO_EKF:
     def get_angular_velocity(self):
         with self._lock: 
             return self._w_b.copy()
+
+    def get_visual_health(self):
+        with self._lock:
+            if self._vis_reject_streak >= 10:
+                mode = "VISION_DEGRADED"
+            elif self._vis_noise_scale > 2.0:
+                mode = "VISION_ADAPTIVE"
+            else:
+                mode = "NOMINAL"
+            return {
+                "mode": mode,
+                "noise_scale": float(self._vis_noise_scale),
+                "reject_streak": int(self._vis_reject_streak),
+                "accept_count": int(self._vis_accept_count),
+                "reject_count": int(self._vis_reject_count),
+                "nis_ema": float(self._vis_nis_ema),
+                "nis_last": float(self._vis_last_nis),
+            }
 
     def update_visual(self, prev_pts, curr_pts, prev_depth, K, T_ic, T_ci, frame_ts=None):
         """
@@ -449,6 +475,7 @@ class VIO_EKF:
                                     np.deg2rad(0.5), np.deg2rad(20.0)))
 
             Rm = np.diag([sigma_p * sigma_p] * 3 + [sigma_r * sigma_r] * 3).astype(np.float64)
+            Rm *= self._vis_noise_scale
             H = np.zeros((6, 15), dtype=np.float64)
             H[:3, :3] = np.eye(3)
             H[3:, 6:9] = np.eye(3)
@@ -456,6 +483,29 @@ class VIO_EKF:
             r = np.hstack([r_p, r_th]).astype(np.float64)
             S = H @ self.P @ H.T + Rm
             try:
+                S_inv_r = np.linalg.solve(S, r)
+                nis = float(r @ S_inv_r)
+                self._vis_last_nis = nis
+                self._vis_nis_ema = 0.9 * self._vis_nis_ema + 0.1 * nis
+                # Adaptive visual noise + consistency gating.
+                if nis > VIS_NIS_CHI2_99 * max(1.0, self._vis_noise_scale):
+                    self._vis_reject_streak += 1
+                    self._vis_reject_count += 1
+                    self._vis_noise_scale = min(12.0, self._vis_noise_scale * 1.25)
+                    self.residual_log.append({
+                        "tick": self._step_count,
+                        "type": "visual_reject_nis",
+                        "nis": nis,
+                        "noise_scale": float(self._vis_noise_scale),
+                        "inliers": int(len(inl)),
+                    })
+                    return False, int(len(inl))
+
+                if nis > VIS_NIS_CHI2_95:
+                    self._vis_noise_scale = min(12.0, self._vis_noise_scale * 1.10)
+                else:
+                    self._vis_noise_scale = max(1.0, self._vis_noise_scale * 0.985)
+
                 K_gain = self.P @ H.T @ np.linalg.inv(S)
             except np.linalg.LinAlgError:
                 return False, int(len(inl))
@@ -483,6 +533,8 @@ class VIO_EKF:
 
             self._last_v_p = self.p.copy()
             self._last_v_R = self.R.copy()
+            self._vis_reject_streak = 0
+            self._vis_accept_count += 1
             R_wc_corr = self.R @ T_ic[:3, :3]
             p_wc_corr = self.p + self.R @ T_ic[:3, 3]
             self._last_vis_cam_pose = (R_wc_corr.copy(), p_wc_corr.copy())
@@ -497,6 +549,8 @@ class VIO_EKF:
                 "reproj_rmse_px": rmse,
                 "pos_residual_m": float(np.linalg.norm(r_p)),
                 "rot_residual_deg": float(np.rad2deg(np.linalg.norm(r_th))),
+                "nis": float(self._vis_last_nis),
+                "noise_scale": float(self._vis_noise_scale),
             })
             return True, int(len(inl))
 

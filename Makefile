@@ -15,23 +15,23 @@ venv:
 
 install-pi: venv
 	$(PIP) install --upgrade pip
-	$(PIP) install -r requirements-pi.txt
+	$(PIP) install -r requirements/requirements-pi.txt
 
 install-laptop: venv
 	$(PIP) install --upgrade pip
-	$(PIP) install -r requirements-laptop.txt
+	$(PIP) install -r requirements/requirements-laptop.txt
 
 check:
-	$(PYTHON) -m py_compile load_config.py utils.py ekf.py record.py reconstruct.py
+	$(PYTHON) -m py_compile src/load_config.py src/utils.py src/ekf.py src/record.py src/reconstruct.py
 
 record:
-	$(RUN) record.py
+	$(RUN) src/record.py
 
 reconstruct:
-	$(RUN) reconstruct.py
+	$(RUN) src/reconstruct.py
 
 regression:
-	$(RUN) regression_harness.py
+	$(RUN) src/regression_harness.py
 
 regression-score:
-	$(RUN) regression_harness.py --no-run
+	$(RUN) src/ regression_harness.py --no-run

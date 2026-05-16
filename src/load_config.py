@@ -3,7 +3,7 @@ import json
 import sys
 
 # Safely resolve path relative to this file
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config/config.json")
 
 try:
     with open(CONFIG_PATH, "r") as f:

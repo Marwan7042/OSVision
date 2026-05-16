@@ -1088,7 +1088,7 @@ cam.video.link(jpeg_enc.input)
 xout_jpeg = pipeline.create(dai.node.XLinkOut)
 xout_jpeg.setStreamName("mjpeg")
 xout_jpeg.input.setBlocking(False)
-xout_jpeg.input.setQueueSize(2)
+xout_jpeg.input.setQueueSize(1)
 jpeg_enc.bitstream.link(xout_jpeg.input)
 
 mono_l = pipeline.create(dai.node.MonoCamera)
@@ -1153,11 +1153,11 @@ imu_n.out.link(xout_i.input)
 sync = pipeline.create(dai.node.Sync)
 sync.setSyncThreshold(timedelta(milliseconds=30))
 sync.inputs["rgb"].setBlocking(False)
-sync.inputs["rgb"].setQueueSize(2)
+sync.inputs["rgb"].setQueueSize(1)
 sync.inputs["depth"].setBlocking(False)
-sync.inputs["depth"].setQueueSize(2)
+sync.inputs["depth"].setQueueSize(1)
 sync.inputs["features"].setBlocking(False)
-sync.inputs["features"].setQueueSize(2)
+sync.inputs["features"].setQueueSize(1)
 
 cam.isp.link(sync.inputs["rgb"])
 stereo.depth.link(sync.inputs["depth"])
@@ -1166,7 +1166,7 @@ feat.outputFeatures.link(sync.inputs["features"])
 xout_s = pipeline.create(dai.node.XLinkOut)
 xout_s.setStreamName("synced")
 xout_s.input.setBlocking(False)
-xout_s.input.setQueueSize(2)
+xout_s.input.setQueueSize(1)
 sync.out.link(xout_s.input)
 
 # ============================================================
@@ -1229,8 +1229,8 @@ with dai.Device(pipeline) as device:
     vis_t.start()
     lk_thread.start()
 
-    qs = device.getOutputQueue("synced", 4, False)
-    qj = device.getOutputQueue("mjpeg", 2, False) 
+    qs = device.getOutputQueue("synced", 1, False)
+    qj = device.getOutputQueue("mjpeg", 1, False) 
     control_q = device.getInputQueue("control")
 
     count = 0

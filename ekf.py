@@ -377,15 +377,23 @@ class VIO_EKF:
             fx, fy = float(K[0, 0]), float(K[1, 1])
             cx, cy = float(K[0, 2]), float(K[1, 2])
 
-            xs = prev_pts[:, 0].astype(np.float64, copy=False)
-            ys = prev_pts[:, 1].astype(np.float64, copy=False)
+            # Feature tracks come from ISP resolution, depth may be downscaled.
+            # Scale feature coordinates into the depth map before depth lookup.
+            depth_h, depth_w = prev_depth.shape[:2]
+            track_w = max(1.0, 2.0 * cx)
+            track_h = max(1.0, 2.0 * cy)
+            scale_x = depth_w / track_w
+            scale_y = depth_h / track_h
+
+            xs = (prev_pts[:, 0] * scale_x).astype(np.float64, copy=False)
+            ys = (prev_pts[:, 1] * scale_y).astype(np.float64, copy=False)
             z_mm = _batch_depth_lookup_jit(
                 prev_depth,
                 xs,
                 ys,
                 DEPTH_PATCH_R,
-                prev_depth.shape[0],
-                prev_depth.shape[1],
+                depth_h,
+                depth_w,
                 DEPTH_MIN_MM,
                 DEPTH_MAX_MM,
             )
@@ -651,18 +659,18 @@ class VIO_EKF:
             if not c_pose: continue
             
             p_c = c_pose["R"].T @ (p3d_w - c_pose["p"])
-            x, y, z_depth = p_c[0], p_c[1], p_c[2]
+            pc_x, pc_y, z_depth = p_c[0], p_c[1], p_c[2]
             
             if z_depth < 0.1: continue # Reject points behind camera
             
-            u_hat = K[0,0] * (x / z_depth) + K[0,2]
-            v_hat = K[1,1] * (y / z_depth) + K[1,2]
+            u_hat = K[0,0] * (pc_x / z_depth) + K[0,2]
+            v_hat = K[1,1] * (pc_y / z_depth) + K[1,2]
             
             r_stack.append([u - u_hat, v - v_hat])
             
             dz_dp = np.array([
-                [1/z_depth, 0, -x/(z_depth**2)],
-                [0, 1/z_depth, -y/(z_depth**2)]
+                [1/z_depth, 0, -pc_x/(z_depth**2)],
+                [0, 1/z_depth, -pc_y/(z_depth**2)]
             ])
             Hf = dz_dp @ c_pose["R"].T
             Hf_stack.append(Hf)

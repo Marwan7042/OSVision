@@ -250,12 +250,29 @@ def load_depth_raw(path):
     """Loads either raw .u16 binary files or compressed .png correctly"""
     if path.endswith('.u16'):
         d_1d = np.fromfile(path, dtype=np.uint16)
-        expected_size = RAW_W * RAW_H
-        if len(d_1d) == expected_size:
-            return d_1d.reshape(RAW_H, RAW_W)
-        else:
-            print(f"  [ERROR] .u16 depth size mismatch! Expected {expected_size}, got {len(d_1d)}")
-            return None
+        n = len(d_1d)
+
+        # Accept full-res and common downscaled aligned depth resolutions.
+        candidates = [
+            (RAW_W, RAW_H),
+            (RAW_W // 2, RAW_H // 2),
+            (640, 360),
+            (960, 540),
+            (1280, 720),
+        ]
+        seen = set()
+        for w, h in candidates:
+            if w <= 0 or h <= 0:
+                continue
+            key = (w, h)
+            if key in seen:
+                continue
+            seen.add(key)
+            if n == w * h:
+                return d_1d.reshape(h, w)
+
+        print(f"  [ERROR] .u16 depth size unknown: {n}")
+        return None
     else:
         return cv2.imread(path, cv2.IMREAD_ANYDEPTH)
 

@@ -1,4 +1,3 @@
-/coral_scan2
-/coral_scan1
-coral_scan
 /__pycache__
+/.venv
+*.pyc

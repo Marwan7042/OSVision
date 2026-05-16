@@ -1,0 +1,2 @@
+-r requirements-common.txt
+open3d==0.18.0

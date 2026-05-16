@@ -222,6 +222,8 @@ class VIO_EKF:
         self.pre_dv = np.zeros(3, dtype=np.float64)
         self.pre_dR = np.eye(3, dtype=np.float64)
         self.pre_dt = 0.0
+        self._last_vis_cam_pose = None
+        self._last_vis_ts = None
 
     def feed_imu(self, a, g, ts):
         with self._lock: 
@@ -327,6 +329,176 @@ class VIO_EKF:
     def get_angular_velocity(self):
         with self._lock: 
             return self._w_b.copy()
+
+    def update_visual(self, prev_pts, curr_pts, prev_depth, K, T_ic, T_ci, frame_ts=None):
+        """
+        Performs a tightly-coupled visual correction using depth-backed 3D-2D PnP.
+        """
+        with self._lock:
+            if not self.gravity_ready:
+                return False, 0
+
+            if prev_pts is None or curr_pts is None or prev_depth is None:
+                return False, 0
+            if len(prev_pts) < MIN_FEAT_UPDATE or len(curr_pts) < MIN_FEAT_UPDATE:
+                return False, 0
+
+            if self._last_vis_ts is not None and frame_ts is not None:
+                dt = float(frame_ts - self._last_vis_ts)
+                if dt <= 0.0 or dt > 0.5:
+                    self._last_vis_cam_pose = None
+
+            fx, fy = float(K[0, 0]), float(K[1, 1])
+            cx, cy = float(K[0, 2]), float(K[1, 2])
+
+            xs = prev_pts[:, 0].astype(np.float64, copy=False)
+            ys = prev_pts[:, 1].astype(np.float64, copy=False)
+            z_mm = _batch_depth_lookup_jit(
+                prev_depth,
+                xs,
+                ys,
+                DEPTH_PATCH_R,
+                prev_depth.shape[0],
+                prev_depth.shape[1],
+                DEPTH_MIN_MM,
+                DEPTH_MAX_MM,
+            )
+            valid = z_mm > 0.0
+            if int(np.count_nonzero(valid)) < MIN_FEAT_UPDATE:
+                return False, int(np.count_nonzero(valid))
+
+            z = (z_mm[valid] * 1e-3).astype(np.float64, copy=False)
+            up = prev_pts[valid, 0].astype(np.float64, copy=False)
+            vp = prev_pts[valid, 1].astype(np.float64, copy=False)
+            uc = curr_pts[valid, 0].astype(np.float64, copy=False)
+            vc = curr_pts[valid, 1].astype(np.float64, copy=False)
+
+            X = (up - cx) * z / fx
+            Y = (vp - cy) * z / fy
+            obj_pts = np.stack([X, Y, z], axis=1).astype(np.float32)
+            img_pts = np.stack([uc, vc], axis=1).astype(np.float32)
+
+            if obj_pts.shape[0] < 6:
+                return False, int(obj_pts.shape[0])
+
+            ok, rvec, tvec, inliers = cv2.solvePnPRansac(
+                obj_pts,
+                img_pts,
+                K.astype(np.float64),
+                None,
+                flags=cv2.SOLVEPNP_ITERATIVE,
+                iterationsCount=100,
+                reprojectionError=3.0,
+                confidence=0.99,
+            )
+            if not ok or inliers is None or len(inliers) < 6:
+                return False, 0
+
+            inl = inliers.flatten()
+            obj_inl = obj_pts[inl]
+            img_inl = img_pts[inl]
+
+            ok_refine, rvec, tvec = cv2.solvePnP(
+                obj_inl,
+                img_inl,
+                K.astype(np.float64),
+                None,
+                rvec=rvec,
+                tvec=tvec,
+                useExtrinsicGuess=True,
+                flags=cv2.SOLVEPNP_ITERATIVE,
+            )
+            if not ok_refine:
+                return False, int(len(inl))
+
+            reproj, _ = cv2.projectPoints(obj_inl, rvec, tvec, K.astype(np.float64), None)
+            reproj_err = img_inl - reproj.reshape(-1, 2)
+            rmse = float(np.sqrt(np.mean(np.sum(reproj_err * reproj_err, axis=1))))
+
+            R_pc, _ = cv2.Rodrigues(rvec)
+            t_pc = tvec.reshape(3).astype(np.float64)
+
+            if self._last_vis_cam_pose is None:
+                R_wc_init = self.R @ T_ic[:3, :3]
+                p_wc_init = self.p + self.R @ T_ic[:3, 3]
+                self._last_vis_cam_pose = (R_wc_init.copy(), p_wc_init.copy())
+                self._last_vis_ts = frame_ts
+                return False, int(len(inl))
+
+            R_wc_prev, p_wc_prev = self._last_vis_cam_pose
+            R_wc_meas = R_wc_prev @ R_pc.T
+            p_wc_meas = p_wc_prev - (R_wc_meas @ t_pc)
+
+            # Convert measured world camera pose to measured world IMU pose.
+            R_wi_meas = R_wc_meas @ T_ci[:3, :3]
+            p_wi_meas = p_wc_meas + (R_wc_meas @ T_ci[:3, 3])
+
+            r_p = p_wi_meas - self.p
+            r_th = _mat_to_rotvec_jit(self.R.T @ R_wi_meas)
+            if not np.isfinite(r_p).all() or not np.isfinite(r_th).all():
+                return False, int(len(inl))
+
+            if np.linalg.norm(r_p) > 2.0 or np.linalg.norm(r_th) > np.deg2rad(40.0):
+                self._last_vis_cam_pose = None
+                self._last_vis_ts = frame_ts
+                return False, int(len(inl))
+
+            inlier_ratio = float(len(inl)) / float(obj_pts.shape[0])
+            sigma_p = float(np.clip(0.02 + 0.10 * rmse + (1.0 - inlier_ratio) * 0.08, 0.01, 0.30))
+            sigma_r = float(np.clip(np.deg2rad(0.8 + 8.0 * rmse + (1.0 - inlier_ratio) * 8.0),
+                                    np.deg2rad(0.5), np.deg2rad(20.0)))
+
+            Rm = np.diag([sigma_p * sigma_p] * 3 + [sigma_r * sigma_r] * 3).astype(np.float64)
+            H = np.zeros((6, 15), dtype=np.float64)
+            H[:3, :3] = np.eye(3)
+            H[3:, 6:9] = np.eye(3)
+
+            r = np.hstack([r_p, r_th]).astype(np.float64)
+            S = H @ self.P @ H.T + Rm
+            try:
+                K_gain = self.P @ H.T @ np.linalg.inv(S)
+            except np.linalg.LinAlgError:
+                return False, int(len(inl))
+
+            dx = K_gain @ r
+            self.p += dx[0:3]
+            self.v += dx[3:6]
+            dth = dx[6:9]
+            dR, _ = cv2.Rodrigues(dth.astype(np.float64))
+            self.R = self.R @ dR
+            self.ba += dx[9:12]
+            self.bg += dx[12:15]
+
+            I = np.eye(15, dtype=np.float64)
+            KH = K_gain @ H
+            self.P = (I - KH) @ self.P @ (I - KH).T + K_gain @ Rm @ K_gain.T
+            self.P = 0.5 * (self.P + self.P.T)
+
+            if np.isnan(self.p).any() or np.isnan(self.R).any() or np.isnan(self.P).any():
+                if self._last_v_p is not None:
+                    self.p[:] = self._last_v_p
+                    self.R[:] = self._last_v_R
+                self.P[:] = np.eye(15, dtype=np.float64) * 1e-3
+                return False, int(len(inl))
+
+            self._last_v_p = self.p.copy()
+            self._last_v_R = self.R.copy()
+            R_wc_corr = self.R @ T_ic[:3, :3]
+            p_wc_corr = self.p + self.R @ T_ic[:3, 3]
+            self._last_vis_cam_pose = (R_wc_corr.copy(), p_wc_corr.copy())
+            self._last_vis_ts = frame_ts
+
+            self.residual_log.append({
+                "tick": self._step_count,
+                "type": "visual_pnp",
+                "inliers": int(len(inl)),
+                "tracks": int(obj_pts.shape[0]),
+                "inlier_ratio": inlier_ratio,
+                "reproj_rmse_px": rmse,
+                "pos_residual_m": float(np.linalg.norm(r_p)),
+                "rot_residual_deg": float(np.rad2deg(np.linalg.norm(r_th))),
+            })
+            return True, int(len(inl))
 
     def add_visual_tracks(self, frame_id, features_dict, K, T_ic):
         """

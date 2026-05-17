@@ -20,11 +20,11 @@ The pipeline fuses high-frequency inertial data with stereo vision utilizing a 1
 
 ## Architecture and Key Features
 
-* **Hardware-Level Sensor Synchronization:** Utilizes Luxonis DepthAI spatial nodes to align RGB, depth, and VPU feature timestamps, mitigating Out-Of-Sequence Measurement (OOSM) errors.
-* **15-DOF ESKF Formulation:** Estimates position, velocity, orientation SO(3), and IMU biases. Implements a local error-state Lie algebra formulation to prevent covariance singularities.
-* **Dynamic Motion-Blur Gating:** Calculates estimated pixel blur as a function of focal length and real-time angular velocity. Frames exceeding the defined threshold are rejected prior to visual processing.
-* **CPU Optical Flow Fallback:** In the event of VPU tracking failure (e.g., rapid illumination changes), the system initiates CPU-bound Lucas-Kanade optical flow to maintain feature tracking and state continuity.
-* **Asynchronous Concurrency:** Implements isolated threads for hardware acquisition, visual processing, and disk I/O, utilizing zero-copy double-buffering and Numba JIT compilation to manage execution latency.
+* **VPU-Offloaded Acquisition:** DepthAI handles RGB/depth synchronization and feature tracking on-device, so the Raspberry Pi mostly orchestrates capture, telemetry, and logging instead of doing the heavy image work itself.
+* **15-DOF ESKF / MSCKF Fusion:** Estimates position, velocity, orientation SO(3), and IMU biases with tightly-coupled visual-inertial updates and manifold pre-integration.
+* **Information-Aware Keyframe Gating:** Accepts frames using depth validity, Laplacian blur, feature coverage, and parallax scoring instead of a simple blur-only rule.
+* **Asynchronous Concurrency:** Uses separate workers for acquisition, IMU propagation, visual updates, and disk I/O, with zero-copy buffering and Numba acceleration where available.
+* **CUDA-First Reconstruction:** Offline reconstruction prefers CUDA when available; OpenCL is used as an iGPU fallback for preprocessing and acceleration on non-CUDA hosts.
 
 ---
 
@@ -59,7 +59,7 @@ make install-laptop
 - `src/slam/pipelines/acquisition.py` — acquisition pipeline
 - `src/slam/pipelines/reconstruction.py` — reconstruction pipeline
 - `src/slam/pipelines/benchmarking.py` — benchmark scoring pipeline
-- `src/slam/dashboard/frontend.py` — browser dashboard client
+- `src/slam/dashboard/client.py` — browser dashboard client
 - `src/slam/dashboard/server.py` — browser dashboard server
 - `src/slam/cli.py` — command runner for `python -m slam`
 - `requirements/` — pinned dependency sets for Pi and laptop environments
@@ -92,9 +92,10 @@ make reconstruct
 ## System Components
 
 ### 1. Acquisition and Gating (`slam/pipelines/acquisition.py`)
-Handles data ingestion, thread management, and initial data validation.
-* **Statistical Gating:** Evaluates spatial point variance to filter unstructured feature tracking and applies the gyroscopic blur threshold.
+Handles data ingestion, hardware control, VPU feature tracking, and initial data validation.
+* **Adaptive Gating:** Evaluates depth validity, Laplacian blur, feature coverage, and parallax to decide which frames become keyframes.
 * **Telemetry Watchdog:** Monitors hardware bus activity. Stalls exceeding 5.0 seconds trigger a safe pipeline termination and data flush.
+* **HUD Control Loop:** Serves the browser dashboard and forwards camera parameter changes back to DepthAI.
 
 ### 2. State Estimator (`slam/estimation/state_estimator.py`)
 The primary numerical filter, with core matrix operations compiled via Numba.
@@ -104,9 +105,9 @@ The primary numerical filter, with core matrix operations compiled via Numba.
 
 ### 3. Reconstruction Backend (`slam/pipelines/reconstruction.py`)
 Handles global trajectory optimization and volumetric mapping.
-* **Color Equalization:** Optionally leverages OpenCL (`cv2.UMat`) for hardware-accelerated red-channel attenuation correction.
-* **Pose Graph Optimization:** Utilizes Multi-Scale ICP for scan matching. Applies Singular Value Decomposition (SVD) on local point cloud normals to reject geometrically degenerate (planar) loop closures.
-* **TSDF Integration:** Fuses the depth maps into a voxel grid, utilizing CUDA (`o3d.t.geometry.VoxelBlockGrid`) when compatible hardware is present.
+* **Color Equalization:** Uses OpenCL (`cv2.UMat`) when available for accelerated preprocessing, otherwise falls back to CPU.
+* **Pose Graph Optimization:** Uses multi-scale ICP and colored ICP to refine tracking and loop closures, with acceptance gated by fitness and RMSE.
+* **TSDF Integration:** Fuses the depth maps into a voxel grid; CUDA is preferred when available, otherwise the pipeline falls back to the legacy CPU path.
 
 ---
 

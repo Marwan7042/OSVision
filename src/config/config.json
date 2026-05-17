@@ -1,99 +1,127 @@
 {
-    "paths": {
-        "scan_dir": "./scan"
+  "_comment_GLOBAL": "Triton ROV Master Config. Split into Pi 4 (Edge) and Base Station (Host) domains.",
+  
+  "paths": {
+    "scan_dir": "./scan"
+  },
+
+  "_comment_DOMAIN_1": "====== ON-BOARD ACQUISITION (RASPBERRY PI 4) ======",
+
+  "hardware": {
+    "calibration_mode": "custom",
+    "target_fps": 10,
+    "imu_rate_hz": 200,
+    "use_ir_projector": true,
+    "ir_dot_brightness_ma": 800,
+    "lock_exposure": true,
+    "exposure_time_us": 12000,
+    "_exposure_time_why": "TRAP 1 DEFUSED: Increased from 8000us to 12000us. 8ms is too dark underwater. 12ms prevents motion blur at 15fps while ensuring the Myriad X VPU receives enough light to track features.",
+    "iso_sensitivity": 800,
+    "decimate_factor": 1,
+    "enable_intel_igpu": false
+  },
+
+  "keyframe_gating": {
+    "min_frame_gap": 3,
+    "max_frame_gap": 20,
+    "min_depth_valid_ratio": 0.22,
+    "max_blur_pixels": 120.0
+  },
+
+  "quality_control": {
+    "score_good_threshold": 0.68,
+    "score_weak_threshold": 0.35,
+    "ideal_depth_ratio": 0.38,
+    "severe_blur_px": 15.0,
+    "weight_depth": 0.55,
+    "weight_blur": 0.45
+  },
+
+  "information_gating": {
+    "min_information_score": 0.38,
+    "weight_depth": 0.42,
+    "weight_blur": 0.23,
+    "weight_coverage": 0.20,
+    "weight_parallax": 0.15
+  },
+
+  "runtime_budgets": {
+    "visual_p95_ms": 18.0,
+    "disk_p95_ms": 25.0,
+    "main_loop_p95_ms": 30.0,
+    "report_interval_sec": 6.0,
+    "queue_pressure_raise": 0.55,
+    "queue_pressure_recover": 0.25
+  },
+
+  "recovery_modes": {
+    "vision_weak_min_frame_gap": 4,
+    "imu_only_min_frame_gap": 10,
+    "imu_only_hold_sec": 5.0,
+    "disk_pressure_min_frame_gap": 12,
+    "disk_pressure_save_stride": 2,
+    "disk_pressure_queue_fill": 0.65,
+    "vision_weak_info_bonus": 0.06
+  },
+
+  "time_sync": {
+    "warn_abs_offset_s": 0.025,
+    "warn_drift_s_per_s": 0.003,
+    "offset_ewma_alpha": 0.06
+  },
+
+  "color_restore": {
+    "enabled": true,
+    "r_max_gain": 2.8,
+    "g_max_gain": 1.15,
+    "apply_to_hud": false,
+    "_apply_to_hud_why": "TRAP 2 DEFUSED: Set to false. Prevents the Pi from burning a CPU core trying to compress a color-restored JPEG. The client-side HUD will use CSS filters to simulate this.",
+    "apply_to_recording": true
+  },
+
+  "ekf_tuning": {
+    "static_variance_threshold": 0.012,
+    "static_variance_window": 80,
+    "min_gravity_samples": 160,
+    "min_feature_update": 8,
+    "depth_patch_radius": 2,
+    "depth_min_mm": 180.0,
+    "depth_max_mm": 6000.0,
+    "imu_vibration_multiplier": 18.0
+  },
+
+  "_comment_DOMAIN_2": "====== OFFLINE RECONSTRUCTION (POWERFUL STATION) ======",
+
+  "reconstruction": {
+    "depth_quantile_pruning": 0.95,
+    "voxel_tracking_m": 0.02,
+    "voxel_loop_m": 0.04,
+    "voxel_tsdf_m": 0.005,
+    "_voxel_tsdf_why": "5mm resolution. This requires massive VRAM and computational power (O(N^3) complexity). Safe here because it runs on the base station, not the Pi.",
+    "appearance_gate": {
+      "enabled": true,
+      "similarity_threshold": 0.55,
+      "spatial_gate_multiplier": 3.0
     },
-    "hardware": {
-        "calibration_mode": "custom",
-        "target_fps": 10,
-        "imu_rate_hz": 200,
-        "use_ir_projector": true,
-        "ir_dot_brightness_ma": 800,
-        "lock_exposure": true,
-        "exposure_time_us": 15000,
-        "iso_sensitivity": 800,
-        "decimate_factor": 1,
-        "enable_intel_igpu": true
-    },
-    "keyframe_gating": {
-        "min_frame_gap": 2,
-        "max_frame_gap": 15,
-        "min_depth_valid_ratio": 0.25,
-        "max_blur_pixels": 5.0
-    },
-    "information_gating": {
-        "min_information_score": 0.45,
-        "weight_depth": 0.4,
-        "weight_blur": 0.25,
-        "weight_coverage": 0.2,
-        "weight_parallax": 0.15
-    },
-    "runtime_budgets": {
-        "visual_p95_ms": 22.0,
-        "disk_p95_ms": 14.0,
-        "main_loop_p95_ms": 35.0,
-        "report_interval_sec": 8.0,
-        "queue_pressure_raise": 0.7,
-        "queue_pressure_recover": 0.35
-    },
-    "recovery_modes": {
-        "vision_weak_min_frame_gap": 4,
-        "imu_only_min_frame_gap": 8,
-        "imu_only_hold_sec": 6.0,
-        "disk_pressure_min_frame_gap": 10,
-        "disk_pressure_save_stride": 2,
-        "disk_pressure_queue_fill": 0.7,
-        "vision_weak_info_bonus": 0.08
-    },
-    "time_sync": {
-        "warn_abs_offset_s": 0.03,
-        "warn_drift_s_per_s": 0.004,
-        "offset_ewma_alpha": 0.08
-    },
-    "color_restore": {
-        "enabled": true,
-        "r_max_gain": 3.0,
-        "g_max_gain": 1.2,
-        "apply_to_hud": true,
-        "apply_to_recording": true
-    },
-    "quality_control": {
-        "ideal_depth_ratio": 0.40,
-        "severe_blur_px": 10.0,
-        "score_good_threshold": 0.75,
-        "score_weak_threshold": 0.40
-    },
-    "ekf_tuning": {
-        "static_variance_threshold": 0.01,
-        "static_variance_window": 100,
-        "min_gravity_samples": 150,
-        "min_feature_update": 12,
-        "depth_patch_radius": 2,
-        "depth_min_mm": 300.0,
-        "depth_max_mm": 5000.0,
-        "imu_vibration_multiplier": 15.0
-    },
-    "reconstruction": {
-        "depth_quantile_pruning": 0.95,
-        "voxel_tracking_m": 0.02,
-        "voxel_loop_m": 0.04,
-        "voxel_tsdf_m": 0.005,
-        "loop_closure_interval": 10,
-        "min_loop_frame_distance": 50,
-        "allow_multi_loops": false,
-        "loop_top_k": 3,
-        "z_regularize": true,
-        "min_cloud_points": 200
-    },
-    "loop_closure_quality": {
-        "max_translation_residual_m": 1.2,
-        "max_rotation_residual_deg": 35.0,
-        "switchable_min_weight": 0.2,
-        "min_fgr_fitness": 0.08
-    },
-    "tsdf_quality": {
-        "min_depth_valid_ratio": 0.12,
-        "dynamic_depth_truncation": true,
-        "dynamic_trunc_ewma_alpha": 0.15,
-        "max_tracking_rmse_skip": 0.18
-    }
+    "loop_closure_interval": 10,
+    "min_loop_frame_distance": 50,
+    "allow_multi_loops": false,
+    "loop_top_k": 3,
+    "z_regularize": true,
+    "min_cloud_points": 200
+  },
+
+  "loop_closure_quality": {
+    "max_translation_residual_m": 1.2,
+    "max_rotation_residual_deg": 35.0,
+    "switchable_min_weight": 0.2,
+    "min_fgr_fitness": 0.08
+  },
+
+  "tsdf_quality": {
+    "min_depth_valid_ratio": 0.12,
+    "dynamic_depth_truncation": true,
+    "dynamic_trunc_ewma_alpha": 0.15,
+    "max_tracking_rmse_skip": 0.18
+  }
 }

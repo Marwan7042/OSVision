@@ -33,7 +33,7 @@ The pipeline fuses high-frequency inertial data with stereo vision utilizing a 1
 ### Prerequisites
 * Python 3.8+
 * Luxonis OAK-D S2 (or equivalent DepthAI hardware)
-* Intel iGPU (Optional, required for OpenCL hardware-accelerated color correction)
+* CUDA if applicable, else it falls back to Intel iGPU (Optional, required for OpenCL hardware-accelerated color correction)
 
 ### Setup
 ```bash

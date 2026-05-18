@@ -37,7 +37,7 @@ The pipeline fuses high-frequency inertial data with stereo vision utilizing a 1
 
 ### Setup
 ```bash
-git clone [https://github.com/Marwan7042/OSVision.git](https://github.com/Marwan7042/OSVision.git)
+git clone https://github.com/Marwan7042/OSVision.git
 cd OSVision
 ```
 
